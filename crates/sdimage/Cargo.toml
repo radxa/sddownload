@@ -1,0 +1,13 @@
+[package]
+name = "sdimage"
+version = "2.26.2101"
+edition = "2021"
+rust-version = "1.87"
+description = "Streaming SemiDrive PAC, Android sparse-image and flashloader ELF library"
+
+[dependencies]
+anyhow = "1"
+crc = "3"
+md-5 = "0.10"
+object = { version = "0.36", features = ["read"] }
+tempfile = "3"

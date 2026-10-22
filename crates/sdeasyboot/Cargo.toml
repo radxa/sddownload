@@ -1,0 +1,18 @@
+[package]
+name = "sdeasyboot"
+version = "2.26.2101"
+edition = "2021"
+rust-version = "1.87"
+description = "Native SemiDrive easyboot, extended fastboot and ADB transports"
+
+[dependencies]
+anyhow = "1"
+rusb = "0.9"
+fastboot-protocol = { version = "0.4", default-features = false }
+libadb = { version = "0.6", default-features = false, features = ["host-keys"] }
+embedded-io = { version = "0.6", features = ["std"] }
+embedded-io-async = "0.6"
+futures = { version = "0.3", features = ["executor"] }
+md-5 = "0.10"
+tempfile = "3"
+sdimage = { path = "../sdimage" }

@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/sdimage", "crates/sdeasyboot"]
+resolver = "2"
+
+[package]
+name = "sddownload"
+version = "2.26.2101"
+edition = "2021"
+rust-version = "1.87"
+description = "Native SemiDrive PAC downloader"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+sdimage = { path = "crates/sdimage" }
+sdeasyboot = { path = "crates/sdeasyboot" }
+
+[dev-dependencies]
+assert_cmd = "2"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
