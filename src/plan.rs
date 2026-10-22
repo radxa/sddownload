@@ -40,6 +40,7 @@ impl Plan {
         let mut ssb_da = None;
 
         for (storage, path) in options.inputs() {
+            eprintln!("Opening PAC: {}", path.display());
             let pac = Pac::open(path, !options.skip_verify)
                 .with_context(|| format!("load {storage} PAC {}", path.display()))?;
 
@@ -69,7 +70,25 @@ impl Plan {
                 }
             }
 
-            for (entry, path) in pac.extract(output)? {
+            eprintln!("Extracting PAC to: {}", output.display());
+            let mut current = 0;
+            let total = pac.entries.len();
+            let extracted = pac.extract_with_progress(&output, |entry, destination| {
+                current += 1;
+                eprintln!(
+                    "[{current}/{total}] Extracting {} ({} bytes) -> {}",
+                    entry.partition,
+                    entry.size,
+                    destination.display()
+                );
+            })?;
+            eprintln!(
+                "Extracted {} files from {}",
+                extracted.len(),
+                path.display()
+            );
+
+            for (entry, path) in extracted {
                 let flash = Flash {
                     partition: storage_partition(storage, &entry.partition),
                     path: path.clone(),

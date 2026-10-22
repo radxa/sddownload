@@ -208,6 +208,16 @@ impl Pac {
     /// Atomically extract without traversing symlinks or overwriting unrelated
     /// files. Identical existing files can be reused across multiple PACs.
     pub fn extract(&self, output: impl AsRef<Path>) -> Result<Vec<(Entry, PathBuf)>> {
+        self.extract_with_progress(output, |_, _| {})
+    }
+
+    /// Extract files, reporting each entry and destination before copying it.
+    /// Identical existing files are also reported before checking their contents.
+    pub fn extract_with_progress(
+        &self,
+        output: impl AsRef<Path>,
+        mut progress: impl FnMut(&Entry, &Path),
+    ) -> Result<Vec<(Entry, PathBuf)>> {
         let output = output.as_ref();
         fs::create_dir_all(output)?;
         let root = output.canonicalize()?;
@@ -238,6 +248,7 @@ impl Pac {
             let name = entry.components.last().unwrap();
             valid_name(name)?;
             let path = dir.join(name);
+            progress(entry, &path);
             source.seek(SeekFrom::Start(entry.offset))?;
             let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
             let copied = std::io::copy(&mut (&mut source).take(entry.size), &mut temporary)?;
@@ -300,7 +311,15 @@ mod tests {
         let pac = Pac::open(&source, true).unwrap();
         assert_eq!(pac.entries[0].partition, "ap1$kernel");
         assert!(pac.entries[0].slot_ab);
-        let result = pac.extract(dir.path().join("out")).unwrap();
+        let mut reported = vec![];
+        let result = pac
+            .extract_with_progress(dir.path().join("out"), |entry, path| {
+                assert!(!path.exists());
+                reported.push((entry.clone(), path.to_owned()));
+            })
+            .unwrap();
+
+        assert_eq!(reported, result);
         assert_eq!(fs::read(&result[0].1).unwrap(), b"payload");
     }
 
