@@ -1,7 +1,120 @@
 use super::super::tests::packet;
 use super::*;
 use clap::Parser;
-use std::{os::unix::net::UnixStream, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
+
+#[cfg(unix)]
+fn input_pipe() -> (File, File) {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    (
+        File::from(std::os::fd::OwnedFd::from(reader)),
+        File::from(std::os::fd::OwnedFd::from(writer)),
+    )
+}
+
+#[test]
+fn input_pipe_preserves_binary_bytes_and_reports_eof() {
+    let (reader, mut writer) = input_pipe();
+    let bytes = vec![0, b'\r', b'\n', 0x1a, 0xff, 0x80];
+    let expected = bytes.clone();
+    let writer = thread::spawn(move || writer.write_all(&bytes));
+    let stop = Arc::new(Stop::default());
+    stop.register_input().unwrap();
+    let mut input = Input { file: reader, stop };
+    let mut actual = vec![];
+    input.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    writer.join().unwrap().unwrap();
+}
+
+#[test]
+fn interrupted_cache_write_checks_cancellation_before_retrying() {
+    struct InterruptedWriter {
+        stop: Arc<Stop>,
+        calls: usize,
+    }
+    impl Write for InterruptedWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.stop.cancel(USB_FAILED);
+            Err(io::ErrorKind::Interrupted.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let stop = Arc::new(Stop::default());
+    let mut writer = InterruptedWriter {
+        stop: stop.clone(),
+        calls: 0,
+    };
+    assert!(write_cache(&mut writer, b"payload", &stop).is_err());
+    assert_eq!(writer.calls, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cancellation_retries_if_it_arrives_just_before_readfile() {
+    let (mut reader, mut writer) = input_pipe();
+    let stop = Arc::new(Stop::default());
+    let (checked_tx, checked_rx) = mpsc::sync_channel(1);
+    let (read_tx, read_rx) = mpsc::sync_channel(1);
+    let (rescue_tx, rescue_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    // Bound a broken implementation's wait without terminating a thread.
+    let rescue = thread::spawn(move || {
+        if rescue_rx.recv().is_ok() && done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            let _ = writer.write_all(b"x");
+        }
+    });
+    thread::scope(|scope| {
+        let input_stop = stop.clone();
+        let worker = scope.spawn(move || -> io::Result<()> {
+            input_stop.register_input()?;
+            input_stop.check()?;
+            checked_tx.send(()).unwrap();
+            read_rx.recv().unwrap();
+            // Deliberately bypass Input's pre-read check to reproduce the tiny
+            // cancellation-after-check/before-ReadFile window deterministically.
+            let _ = reader.read(&mut [0]);
+            input_stop.check()
+        });
+        checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        rescue_tx.send(()).unwrap();
+        let start = Instant::now();
+        stop.cancel(USB_FAILED); // No I/O is pending yet: ERROR_NOT_FOUND.
+        read_tx.send(()).unwrap();
+        stop.wait_for_input();
+        let result = worker.join().unwrap();
+        let elapsed = start.elapsed();
+        let _ = done_tx.send(());
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "ReadFile cancellation required the rescue writer"
+        );
+    });
+    rescue.join().unwrap();
+}
+
+#[cfg(windows)]
+fn input_pipe() -> (File, File) {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let (mut reader, mut writer) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both output pointers are valid; null attributes create private,
+    // non-inheritable synchronous handles. Adopt each fresh handle once.
+    assert_ne!(
+        unsafe { CreatePipe(&mut reader, &mut writer, std::ptr::null(), 0) },
+        0
+    );
+    unsafe {
+        (
+            File::from(OwnedHandle::from_raw_handle(reader)),
+            File::from(OwnedHandle::from_raw_handle(writer)),
+        )
+    }
+}
 
 #[derive(Default)]
 struct Flags {
@@ -317,14 +430,13 @@ fn later_inputs_can_add_forward_bootstrap_stages_without_replacing_the_fda() {
 fn usb_failure_cancels_input_while_the_pipe_remains_open() {
     let directory = tempfile::tempdir().unwrap();
     let bytes = packet(&[("kernel", 6, b"first"), ("rootfs", 6, b"later")]);
-    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let (reader, mut writer) = input_pipe();
     let prefix = bytes[..sdimage::pac::TABLE_END as usize + 5].to_vec();
     let writer = thread::spawn(move || {
         let _ = writer.write_all(&prefix);
         writer
     });
-    let file = File::from(std::os::fd::OwnedFd::from(reader));
-    let mut file = Some(file);
+    let mut file = Some(reader);
     let options = Cli::try_parse_from(["sddownload", "--emmc1", "unused"]).unwrap();
     let start = Instant::now();
     let error = run_with_input(
@@ -356,9 +468,9 @@ fn truncated_direct_input_reports_the_input_error_and_cleans_cache() {
     let directory = tempfile::tempdir().unwrap();
     let mut bytes = packet(&[("kernel", 6, b"image")]);
     bytes.pop();
-    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let (reader, mut writer) = input_pipe();
     let writer = thread::spawn(move || writer.write_all(&bytes));
-    let mut file = Some(File::from(std::os::fd::OwnedFd::from(reader)));
+    let mut file = Some(reader);
     let options = Cli::try_parse_from(["sddownload", "--emmc1", "unused"]).unwrap();
     let error = run_with_input(
         &options,
@@ -387,13 +499,13 @@ fn truncated_direct_input_reports_the_input_error_and_cleans_cache() {
 fn target_panic_also_cancels_a_blocked_input_worker() {
     let directory = tempfile::tempdir().unwrap();
     let bytes = packet(&[("kernel", 6, b"first"), ("rootfs", 6, b"later")]);
-    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let (reader, mut writer) = input_pipe();
     let prefix = bytes[..sdimage::pac::TABLE_END as usize + 5].to_vec();
     let writer = thread::spawn(move || {
         let _ = writer.write_all(&prefix);
         writer
     });
-    let mut file = Some(File::from(std::os::fd::OwnedFd::from(reader)));
+    let mut file = Some(reader);
     let options = Cli::try_parse_from(["sddownload", "--emmc1", "unused"]).unwrap();
     let start = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -431,13 +543,13 @@ fn usb_failure_closes_a_partially_written_cache_and_debug_can_retain_it() {
     let prefix = bytes[..sdimage::pac::TABLE_END as usize + 3 + 2 + CHUNK].to_vec();
     for debug in [false, true] {
         let directory = tempfile::tempdir().unwrap();
-        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let (reader, mut writer) = input_pipe();
         let prefix = prefix.clone();
         let writer = thread::spawn(move || {
             let _ = writer.write_all(&prefix);
             writer
         });
-        let mut file = Some(File::from(std::os::fd::OwnedFd::from(reader)));
+        let mut file = Some(reader);
         let mut options = Cli::try_parse_from(["sddownload", "--emmc1", "unused"]).unwrap();
         options.debug = debug;
         let peer = Peer {

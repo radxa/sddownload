@@ -147,6 +147,20 @@ fn stdin_extraction_and_verify_first_reject_bad_crc_without_usb() {
 }
 
 #[test]
+fn normal_stdin_elf_rejection_uses_binary_input_before_device_access() {
+    let bytes = packet(0, &[("FDA", 0, b"\x7fELF\r\n\x1a\xff")], true);
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--auto", "--emmc1", "-"])
+        .write_stdin(bytes)
+        .timeout(Duration::from_secs(5))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("ELF FDA"), "{error}");
+    assert!(!error.contains("ADB auto-reboot"));
+}
+
+#[test]
 fn invalid_arguments_fail_without_device_access() {
     for args in [
         vec![],

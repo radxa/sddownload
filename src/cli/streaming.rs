@@ -16,13 +16,13 @@ use std::{
     time::Duration,
 };
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod pipeline;
 
 trait Target {
     fn connect(&mut self) -> Result<()>;
     fn is_rom(&self) -> bool;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn has_agent(&mut self) -> Result<bool> {
         self.connect()?;
         Ok(!self.is_rom())
@@ -37,7 +37,7 @@ struct UsbTarget<'a> {
     settings: &'a Config,
     rom: Option<bool>,
     dloader: Option<bool>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     agent_loaded: bool,
 }
 
@@ -48,7 +48,7 @@ impl<'a> UsbTarget<'a> {
             settings,
             rom: None,
             dloader: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             agent_loaded: false,
         })
     }
@@ -105,7 +105,7 @@ impl Target for UsbTarget<'_> {
         self.rom.unwrap_or(true)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn has_agent(&mut self) -> Result<bool> {
         self.connect()?;
         Ok(!self.is_rom() && (self.agent_loaded || self.stage()?))
@@ -143,7 +143,7 @@ impl Target for UsbTarget<'_> {
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
             client.flash_reader(partition, reader, size, false)
         })?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             if plan::is_da(partition) {
                 self.agent_loaded = true;
@@ -184,14 +184,24 @@ struct Cached {
     storage: String,
     entry: Entry,
     file: tempfile::TempPath,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     progress: Option<std::sync::Arc<pipeline::Progress>>,
 }
 
 impl Cached {
     fn reader(&self) -> Result<Box<dyn Read + Send>> {
-        let file = File::open(&self.file)?;
-        #[cfg(unix)]
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            options.share_mode(FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let file = options.open(&self.file)?;
+        #[cfg(any(unix, windows))]
         if let Some(progress) = &self.progress {
             return Ok(Box::new(progress.reader(file)));
         }
@@ -237,7 +247,7 @@ fn cache(
         storage: storage.into(),
         entry,
         file: file.into_temp_path(),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         progress: None,
     })
 }
@@ -510,7 +520,7 @@ fn stream_inputs<T: Target>(
     directory: &Path,
     target: T,
 ) -> Result<(T, BTreeSet<String>)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !options.verify_first {
         return pipeline::run(options, settings, actions, directory, target);
     }
@@ -736,7 +746,7 @@ mod tests {
                 directory.path(),
                 peer,
             );
-            if !strict && cfg!(unix) {
+            if !strict && cfg!(any(unix, windows)) {
                 let error = result.err().unwrap().to_string();
                 assert!(
                     error.contains("late bootstrap loader") && error.contains("--verify-first")
@@ -796,7 +806,7 @@ mod tests {
                 directory.path(),
                 peer,
             );
-            if !strict && cfg!(unix) {
+            if !strict && cfg!(any(unix, windows)) {
                 assert!(result.err().unwrap().to_string().contains("ELF FDA"));
                 assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
                 continue;

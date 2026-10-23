@@ -125,7 +125,7 @@ curl -fL https://example.com/global.pac | sddownload --emmc1 -
 zstd -dc global.pac.zst | sddownload --emmc1 -
 ```
 
-On Unix (Linux and Darwin), normal mode uses a background input worker while
+On Linux, Darwin, and Windows, normal mode uses a background input worker while
 the calling thread performs USB operations serially. The input worker parses
 headers, calculates CRCs, and continues reading/caching during FDA transfer,
 device initialization, and flashes. USB can read a growing cache file before
@@ -151,9 +151,12 @@ space for prefetched, deferred, and reused data. Payload caches are removed
 after use, including on I/O/protocol failure. Selected loader files are kept
 until completion to compare late copies byte for byte. `--debug` retains cache
 files and the working directory. The temporary directory follows the platform
-default (`TMPDIR` on Unix). Input cancellation also interrupts blocked Unix
-pipe reads when USB fails. In-flight USB calls retain their configured
-timeouts. Other platforms retain sequential scheduling.
+default (`TMPDIR` on Unix). Input cancellation also interrupts blocked pipe
+reads when USB fails. Windows uses binary input handles and cancels synchronous
+I/O on the dedicated input thread, retrying cancellation until that thread
+exits so a read starting just after cancellation cannot strand shutdown.
+In-flight USB calls retain their configured timeouts. Other platforms retain
+sequential scheduling.
 
 By default, CRCs are calculated as the input is consumed and checked when each
 PAC container ends. A CRC failure or late-loader conflict can therefore be

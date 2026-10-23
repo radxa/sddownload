@@ -1,11 +1,8 @@
-//! Unix input producer and serial USB consumer. No USB handle crosses threads.
+//! Concurrent input producer and serial USB consumer. No USB handle crosses threads.
 use super::*;
 use anyhow::bail;
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    os::fd::{AsFd, AsRawFd},
-    os::unix::fs::OpenOptionsExt,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
@@ -13,6 +10,19 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+#[cfg(unix)]
+use unix::open_input;
+#[cfg(all(test, unix))]
+use unix::Input;
+#[cfg(windows)]
+use windows::open_input;
+#[cfg(all(test, windows))]
+use windows::Input;
 
 const CHUNK: usize = 64 * 1024;
 const POLL: Duration = Duration::from_millis(50);
@@ -23,13 +33,15 @@ const FLAT_READY: u8 = 1;
 const AGENT_READY: u8 = 2;
 
 #[derive(Default)]
-struct Stop(AtomicU8);
+struct Stop(AtomicU8, #[cfg(windows)] windows::Cancellation);
 
 impl Stop {
     fn cancel(&self, origin: u8) {
         let _ = self
             .0
             .compare_exchange(0, origin, Ordering::AcqRel, Ordering::Acquire);
+        #[cfg(windows)]
+        self.1.cancel();
     }
 
     fn check(&self) -> io::Result<()> {
@@ -39,78 +51,36 @@ impl Stop {
             Err(io::Error::other("streaming download cancelled"))
         }
     }
+
+    fn register_input(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        self.1.register()?;
+        self.check()
+    }
+
+    fn wait_for_input(&self) {
+        #[cfg(windows)]
+        if self.0.load(Ordering::Acquire) != 0 {
+            self.1.cancel_until_finished();
+        }
+    }
 }
 
-struct CancelOnDrop(Option<Arc<Stop>>);
+struct CancelOnDrop {
+    stop: Option<Arc<Stop>>,
+    receiver: Option<Receiver<Work>>,
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        if let Some(stop) = &self.0 {
+        if let Some(stop) = &self.stop {
             stop.cancel(USB_FAILED);
+            // Release bounded senders before waiting for the worker. During a
+            // panic the receiver would otherwise outlive this guard's Drop.
+            drop(self.receiver.take());
+            stop.wait_for_input();
         }
     }
-}
-
-// Poll a duplicated stdin descriptor rather than buffered Stdin: a blocked pipe
-// must be cancellable when USB fails, and libc buffering must not hide input.
-struct Input {
-    file: File,
-    stop: Arc<Stop>,
-}
-
-impl Read for Input {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            self.stop.check()?;
-            let mut descriptor = libc::pollfd {
-                fd: self.file.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: descriptor is valid for the duration of this call.
-            let ready = unsafe { libc::poll(&mut descriptor, 1, POLL.as_millis() as i32) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if ready != 0 {
-                self.stop.check()?;
-                match self.file.read(buffer) {
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        continue
-                    }
-                    result => return result,
-                }
-            }
-        }
-    }
-}
-
-fn open_input(path: &Path, stop: &Arc<Stop>) -> Result<Box<dyn Read + Send>> {
-    let file = if path == Path::new("-") {
-        File::from(io::stdin().as_fd().try_clone_to_owned()?)
-    } else {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .with_context(|| format!("open PAC {}", path.display()))?
-    };
-    Ok(Box::new(Input {
-        file,
-        stop: stop.clone(),
-    }))
 }
 
 pub(super) struct Progress {
@@ -252,6 +222,21 @@ fn copy_entry(
     }
 }
 
+fn write_cache(writer: &mut impl Write, mut bytes: &[u8], stop: &Stop) -> io::Result<()> {
+    // Unlike Write::write_all, check cancellation between interrupted writes.
+    // Windows cancellation can interrupt the producer's cache writes as well.
+    while !bytes.is_empty() {
+        stop.check()?;
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn produce(
     options: &Cli,
@@ -360,7 +345,7 @@ fn produce(
                     .map_err(|_| anyhow::anyhow!("USB worker stopped"))?;
                 let mut written = 0;
                 let result = copy_entry(&mut pac, stop, |bytes| {
-                    writer.write_all(bytes)?;
+                    write_cache(&mut writer, bytes, stop)?;
                     written += bytes.len() as u64;
                     progress.publish(written);
                     Ok(())
@@ -642,12 +627,16 @@ fn run_with_input<T: Target>(
     };
     thread::scope(|scope| {
         // A target panic must also release a producer waiting for more input.
-        let mut cancel_on_drop = CancelOnDrop(Some(stop.clone()));
+        let mut cancel_on_drop = CancelOnDrop {
+            stop: Some(stop.clone()),
+            receiver: Some(receiver),
+        };
         let producer_stop = stop.clone();
         let producer_mode = mode.clone();
         let producer_in_flight = in_flight.clone();
         let producer = scope.spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
+                producer_stop.register_input()?;
                 produce(
                     options,
                     settings,
@@ -666,16 +655,23 @@ fn run_with_input<T: Target>(
             }
             result
         });
-        let result = consume(&mut early, &receiver, &mode, &in_flight, &stop);
+        let result = consume(
+            &mut early,
+            cancel_on_drop.receiver.as_ref().unwrap(),
+            &mode,
+            &in_flight,
+            &stop,
+        );
         if result.is_err() {
             stop.cancel(USB_FAILED);
         }
         // Wake a producer blocked on the bounded work queue before joining it.
-        drop(receiver);
+        drop(cancel_on_drop.receiver.take());
+        stop.wait_for_input();
         let produced = producer
             .join()
             .map_err(|_| anyhow::anyhow!("PAC input worker panicked"))?;
-        cancel_on_drop.0 = None;
+        cancel_on_drop.stop = None;
         let empty = if stop.0.load(Ordering::Acquire) == INPUT_FAILED {
             produced?;
             result?
