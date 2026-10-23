@@ -44,14 +44,14 @@ flake exposes Linux and Darwin package outputs for both x86-64 and AArch64.
 
 ## CLI compatibility
 
-The existing long options retain their spelling, including underscores:
+Long options use hyphens between words:
 
 ```text
 --ospi1 FILE     --ospi2 FILE     --emmc1 FILE
 --sd FILE        --ssd FILE       --pac FILE       --nvm FILE
---sn SERIAL      --b_part         --skip_verify    --verify-first
+--sn SERIAL      --b-part         --skip-verify    --verify-first
 --auto           --reboot         --debug
---unpac_path DIRECTORY
+--unpac-path DIRECTORY
 --flash PARTITION PATH           (repeatable; - reads stdin)
 --erase 'PARTITION'               (repeatable)
 --read PARTITION PATH            (repeatable; - writes stdout)
@@ -100,7 +100,7 @@ Example configuration:
 Extract without accessing USB:
 
 ```sh
-sddownload --ospi1 firmware.pac --unpac_path ./images
+sddownload --ospi1 firmware.pac --unpac-path ./images
 ```
 
 Download through ROM/FDA and fastboot:
@@ -138,7 +138,7 @@ Only one FDA, PAC, or explicit flash input may use stdin. The raw FDA is staged 
 file to determine its size, so stdin must reach EOF before transfer starts.
 Empty and ELF FDA images are rejected before device access. `--verify-first`
 still validates all PAC CRCs before sending the FDA. `--fda` conflicts with the
-extraction-only `--unpac_path` option.
+extraction-only `--unpac-path` option.
 
 `--flash` and `--read` each require two separate arguments, `PARTITION PATH`,
 and may be repeated for different partitions. Quote partition names containing
@@ -198,7 +198,7 @@ that the entire file must be cached before flashing starts.
 When USB is ready, single-use payloads use a bounded in-memory pipe without a
 temporary file. At a payload boundary, when USB is busy or the payload must
 wait for a loader, input prefetch uses temporary cache files. The work queue and pipe buffers apply
-backpressure. With `--b_part`, an A/B payload is cached while slot A is flashed,
+backpressure. With `--b-part`, an A/B payload is cached while slot A is flashed,
 then replayed for slot B; an already cached payload reuses its existing file.
 
 Normal mode commits to the first eligible FDA/download agent of each kind,
@@ -237,9 +237,9 @@ not use early bootstrap:
 zstd -dc global.pac.zst | sddownload --emmc1 - --verify-first
 ```
 
-`--verify-first` conflicts with `--skip_verify`, which disables PAC CRC and
+`--verify-first` conflicts with `--skip-verify`, which disables PAC CRC and
 flash MD5 checks. Unset PAC CRC fields remain optional in both policies.
-`--unpac_path` still explicitly extracts files; stdin is first staged to a
+`--unpac-path` still explicitly extracts files; stdin is first staged to a
 temporary PAC for that mode. Streaming traversal orders entries by physical
 offset and rejects overlapping entries.
 
@@ -282,7 +282,7 @@ a trailing hole is sent as zero bytes. Large-image transfers stay bounded
 by the device's advertised download size.
 
 PAC CRC uses CRC-32/BZIP2, excluding the checksum word at offset 0x3fc.
-Stored zero/0xffffffff values mean unset. `--skip_verify` bypasses PAC CRC
+Stored zero/0xffffffff values mean unset. `--skip-verify` bypasses PAC CRC
 and flash MD5 checks; readback MD5 is still required before publishing output.
 Nested PAC checksums are checked as well. Bounds, unsafe partition paths,
 invalid sparse geometry, and malformed protocol replies produce errors.

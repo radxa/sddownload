@@ -41,7 +41,7 @@ fn unpack(source: &Path, output: &Path) -> assert_cmd::Command {
     command
         .args(["--ospi1"])
         .arg(source)
-        .arg("--unpac_path")
+        .arg("--unpac-path")
         .arg(output);
     command.timeout(Duration::from_secs(5));
 
@@ -66,13 +66,13 @@ fn supported_options_are_visible_and_removed_options_are_rejected() {
         "--pac",
         "--nvm",
         "--sn",
-        "--b_part",
-        "--skip_verify",
+        "--b-part",
+        "--skip-verify",
         "--verify-first",
         "--auto",
         "--reboot",
         "--debug",
-        "--unpac_path",
+        "--unpac-path",
         "--flash",
         "--erase",
         "--read",
@@ -85,7 +85,13 @@ fn supported_options_are_visible_and_removed_options_are_rejected() {
     assert!(!help.contains("--jlink-config"));
     assert!(!help.contains("--jlink-library"));
 
-    for flag in ["--swd", "--erase_chip"] {
+    for flag in [
+        "--swd",
+        "--erase_chip",
+        "--b_part",
+        "--skip_verify",
+        "--unpac_path",
+    ] {
         assert!(
             !help.contains(flag),
             "removed option {flag} is still visible"
@@ -135,7 +141,7 @@ fn stdin_extraction_and_verify_first_reject_bad_crc_without_usb() {
     let output = directory.path().join("images");
     let mut bytes = packet(0, &[("kernel", 6, b"payload")], true);
     cargo_bin_cmd!("sddownload")
-        .args(["--emmc1", "-", "--unpac_path"])
+        .args(["--emmc1", "-", "--unpac-path"])
         .arg(&output)
         .write_stdin(bytes.clone())
         .timeout(Duration::from_secs(3))
@@ -152,7 +158,7 @@ fn stdin_extraction_and_verify_first_reject_bad_crc_without_usb() {
     let error = String::from_utf8_lossy(&result.get_output().stderr);
     assert!(error.contains("CRC mismatch"));
     assert!(!error.contains("ADB auto-reboot"));
-    assert!(Cli::try_parse_from(["sddownload", "--verify-first", "--skip_verify"]).is_err());
+    assert!(Cli::try_parse_from(["sddownload", "--verify-first", "--skip-verify"]).is_err());
     assert!(sddownload::cli::run_from(["sddownload", "--emmc1", "-", "--ospi1", "-"]) != 0);
 }
 
@@ -204,7 +210,7 @@ fn explicit_fda_stdin_rejects_invalid_images_and_duplicate_stdin_before_usb() {
     );
     assert!(!error.contains("ADB auto-reboot"));
     assert!(
-        Cli::try_parse_from(["sddownload", "--fda", "fda.bin", "--unpac_path", "out"]).is_err()
+        Cli::try_parse_from(["sddownload", "--fda", "fda.bin", "--unpac-path", "out"]).is_err()
     );
 }
 
@@ -422,7 +428,7 @@ fn crc_failure_and_explicit_bypass() {
 
     let accepted = directory.path().join("accepted");
     unpack(&source, &accepted)
-        .arg("--skip_verify")
+        .arg("--skip-verify")
         .assert()
         .success();
     assert_eq!(fs::read(accepted.join("image.bin")).unwrap(), b"dat`");
@@ -450,7 +456,7 @@ fn nested_and_all_in_one_layouts() {
     cargo_bin_cmd!("sddownload")
         .arg("--pac")
         .arg(source)
-        .arg("--unpac_path")
+        .arg("--unpac-path")
         .arg(&output)
         .assert()
         .success();
@@ -521,7 +527,7 @@ fn plan_preserves_bootstrap_order_ab_expansion_and_auto_erase() {
         "sddownload",
         "--emmc1",
         source.to_str().unwrap(),
-        "--b_part",
+        "--b-part",
     ])
     .unwrap();
     let settings = Config::load(None).unwrap();

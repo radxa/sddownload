@@ -1139,7 +1139,7 @@ mod tests {
                 first.to_str().unwrap(),
                 "--emmc1",
                 second.to_str().unwrap(),
-                "--b_part",
+                "--b-part",
             ])
             .unwrap();
             options.verify_first = strict;
@@ -1447,7 +1447,7 @@ mod tests {
             "--emmc1",
             emmc.to_str().unwrap(),
             "--verify-first",
-            "--b_part",
+            "--b-part",
         ])
         .unwrap();
         let (peer, _) = stream_inputs(
@@ -1711,7 +1711,7 @@ mod tests {
     #[test]
     fn ab_payload_is_cached_during_first_flash_then_replayed_and_removed() {
         let directory = tempfile::tempdir().unwrap();
-        let options = Cli::try_parse_from(["sddownload", "--emmc1", "unused", "--b_part"]).unwrap();
+        let options = Cli::try_parse_from(["sddownload", "--emmc1", "unused", "--b-part"]).unwrap();
         let actions = Actions::default();
         let peer = Peer {
             directory: directory.path().into(),

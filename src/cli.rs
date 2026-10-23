@@ -52,10 +52,10 @@ pub struct Cli {
     #[arg(long, default_value = "")]
     pub sn: String,
     /// Flash both slots for images marked as A/B.
-    #[arg(long = "b_part")]
+    #[arg(long)]
     pub b_part: bool,
     /// Skip PAC CRC and flash MD5 verification.
-    #[arg(long = "skip_verify")]
+    #[arg(long)]
     pub skip_verify: bool,
     /// Validate PACs and select final loaders before device access; caches payloads.
     #[arg(long, conflicts_with = "skip_verify")]
@@ -70,7 +70,7 @@ pub struct Cli {
     #[arg(long)]
     pub debug: bool,
     /// Extract PAC images to this directory without accessing USB.
-    #[arg(long = "unpac_path", value_name = "DIRECTORY")]
+    #[arg(long, value_name = "DIRECTORY")]
     pub unpac_path: Option<PathBuf>,
 
     /// Flash an image to a partition; PATH may be - for stdin (repeatable).
@@ -149,7 +149,7 @@ impl Cli {
         if let Some(output) = &self.unpac_path {
             ensure!(
                 !output.as_os_str().is_empty(),
-                "--unpac_path requires a directory"
+                "--unpac-path requires a directory"
             );
         }
 
