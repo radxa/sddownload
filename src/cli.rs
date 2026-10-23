@@ -1,5 +1,5 @@
 use crate::{config::Config, plan::Plan, size};
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use clap::Parser;
 use sdeasyboot::{
     fastboot::FastbootClient,
@@ -73,14 +73,14 @@ pub struct Cli {
     #[arg(long = "unpac_path", value_name = "DIRECTORY")]
     pub unpac_path: Option<PathBuf>,
 
-    /// Flash an image to a partition (repeatable).
-    #[arg(long, value_name = "PARTITION|PATH", action = clap::ArgAction::Append)]
+    /// Flash an image to a partition; PATH may be - for stdin (repeatable).
+    #[arg(long, num_args = 2, value_names = ["PARTITION", "PATH"], action = clap::ArgAction::Append)]
     pub flash: Vec<String>,
     /// Erase a partition (repeatable).
     #[arg(long, value_name = "PARTITION", action = clap::ArgAction::Append)]
     pub erase: Vec<String>,
-    /// Read a partition into a file (repeatable).
-    #[arg(long, value_name = "PARTITION|PATH", action = clap::ArgAction::Append)]
+    /// Read a partition into a file; PATH may be - for stdout (repeatable).
+    #[arg(long, num_args = 2, value_names = ["PARTITION", "PATH"], action = clap::ArgAction::Append)]
     pub read: Vec<String>,
 
     /// Load timeout and auto-erase settings from a JSON file.
@@ -95,7 +95,7 @@ pub struct Cli {
 struct Actions {
     flash: Vec<(String, PathBuf)>,
     erase: Vec<(String, u64)>,
-    read: Vec<(String, PathBuf, u64)>,
+    read: Vec<(String, PathBuf)>,
 }
 
 impl Actions {
@@ -112,9 +112,14 @@ impl Cli {
             .filter(|(_, path)| *path == Path::new("-"))
             .count();
         let fda_stdin = usize::from(self.fda.as_deref() == Some(Path::new("-")));
+        let flash_stdin = self
+            .flash
+            .chunks_exact(2)
+            .filter(|pair| pair[1] == "-")
+            .count();
         ensure!(
-            pac_stdin + fda_stdin <= 1,
-            "stdin can only be used for one input (FDA or PAC)"
+            pac_stdin + fda_stdin + flash_stdin <= 1,
+            "stdin can only be used for one input (FDA, PAC, or --flash)"
         );
         Ok(())
     }
@@ -148,24 +153,27 @@ impl Cli {
             );
         }
 
-        let mut actions = Actions::default();
-
-        for raw in &self.flash {
-            let (partition, path) = raw
-                .split_once('|')
-                .context("--flash requires PARTITION|PATH")?;
-
-            ensure!(!partition.is_empty() && !path.is_empty(), "invalid --flash");
-
+        let mut actions = Actions {
+            flash: partition_paths(&self.flash, "--flash")?,
+            read: partition_paths(&self.read, "--read")?,
+            ..Actions::default()
+        };
+        for (_, path) in &actions.flash {
             ensure!(
-                Path::new(path).is_file(),
-                "flash image does not exist: {path}"
+                path == Path::new("-") || path.is_file(),
+                "flash image does not exist: {}",
+                path.display()
             );
-
-            actions
-                .flash
-                .push((partition.replace("\\$", "$"), path.into()));
         }
+        ensure!(
+            actions
+                .read
+                .iter()
+                .filter(|(_, path)| path == Path::new("-"))
+                .count()
+                <= 1,
+            "stdout can only be used for one --read output"
+        );
 
         for raw in &self.erase {
             let parts: Vec<_> = raw.split('|').collect();
@@ -183,26 +191,25 @@ impl Cli {
             actions.erase.push((parts[0].replace("\\$", "$"), count));
         }
 
-        for raw in &self.read {
-            let parts: Vec<_> = raw.split('|').collect();
-
-            ensure!(
-                (2..=3).contains(&parts.len()) && !parts[0].is_empty() && !parts[1].is_empty(),
-                "--read requires PARTITION|PATH[|SIZE]"
-            );
-
-            let count = if parts.len() == 3 {
-                size::parse(parts[2])?
-            } else {
-                0
-            };
-            actions
-                .read
-                .push((parts[0].replace("\\$", "$"), parts[1].into(), count));
-        }
-
         Ok(actions)
     }
+}
+
+fn partition_paths(values: &[String], option: &str) -> Result<Vec<(String, PathBuf)>> {
+    let pairs = values.chunks_exact(2);
+    ensure!(
+        pairs.remainder().is_empty(),
+        "{option} requires PARTITION PATH"
+    );
+    pairs
+        .map(|pair| {
+            ensure!(
+                !pair[0].is_empty() && !pair[1].is_empty(),
+                "{option} requires nonempty PARTITION and PATH"
+            );
+            Ok((pair[0].replace("\\$", "$"), PathBuf::from(&pair[1])))
+        })
+        .collect()
 }
 
 fn with_fastboot<R>(
@@ -222,9 +229,8 @@ pub fn execute(options: &Cli) -> Result<()> {
 
     if options.unpac_path.is_none() {
         ensure!(
-            actions.erase.iter().all(|(_, size)| *size == 0)
-                && actions.read.iter().all(|(_, _, size)| *size == 0),
-            "sized read/erase arguments require J-Link, which is not supported"
+            actions.erase.iter().all(|(_, size)| *size == 0),
+            "sized erase arguments require J-Link, which is not supported"
         );
     }
 
@@ -239,7 +245,11 @@ pub fn execute(options: &Cli) -> Result<()> {
 
     if options.unpac_path.is_none() {
         streaming::download(options, &settings, &actions, temporary.path())?;
-        println!("Download successfully");
+        if actions.read.iter().any(|(_, path)| path == Path::new("-")) {
+            eprintln!("Download successfully");
+        } else {
+            println!("Download successfully");
+        }
         return Ok(());
     }
 

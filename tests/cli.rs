@@ -109,15 +109,24 @@ fn repeated_scalar_options_override_and_actions_append() {
         "--sn",
         "second",
         "--flash",
-        "one|one.bin",
+        "one",
+        "one.bin",
         "--flash",
-        "two|two.bin",
+        "two",
+        "two.bin",
+        "--read",
+        "three",
+        "three.bin",
+        "--read",
+        "four",
+        "-",
     ])
     .unwrap();
 
     assert_eq!(options.ospi1.unwrap(), Path::new("override.pac"));
     assert_eq!(options.sn, "second");
-    assert_eq!(options.flash, ["one|one.bin", "two|two.bin"]);
+    assert_eq!(options.flash, ["one", "one.bin", "two", "two.bin"]);
+    assert_eq!(options.read, ["three", "three.bin", "four", "-"]);
 }
 
 #[test]
@@ -240,7 +249,7 @@ fn invalid_arguments_fail_without_device_access() {
     for args in [
         vec![],
         vec!["--unknown"],
-        vec!["--auto", "--flash", "x|missing-file.bin"],
+        vec!["--auto", "--flash", "x", "missing-file.bin"],
         vec!["--auto", "--read", "x|out|__import__('os')"],
         vec!["--auto", "--erase", "x|1//0"],
         vec!["--auto", "--swd"],
@@ -253,6 +262,103 @@ fn invalid_arguments_fail_without_device_access() {
             .assert()
             .code(1);
     }
+}
+
+#[test]
+fn flash_and_read_require_two_arguments_per_occurrence() {
+    for option in ["--flash", "--read"] {
+        for arguments in [
+            vec!["sddownload", "--auto", option],
+            vec!["sddownload", "--auto", option, "boot"],
+            vec!["sddownload", "--auto", option, "boot|image.bin"],
+            vec!["sddownload", "--auto", option, "boot", "image.bin", "extra"],
+            vec![
+                "sddownload",
+                "--auto",
+                option,
+                "boot",
+                option,
+                "system",
+                "image.bin",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&arguments).is_err(),
+                "accepted {arguments:?}"
+            );
+        }
+        let options =
+            Cli::try_parse_from(["sddownload", "--auto", option, "emmc1$$boot", "-"]).unwrap();
+        let values = if option == "--flash" {
+            options.flash
+        } else {
+            options.read
+        };
+        assert_eq!(values, ["emmc1$$boot", "-"]);
+        let options = Cli::try_parse_from([
+            "sddownload",
+            "--auto",
+            option,
+            "boot",
+            "path with spaces.bin",
+        ])
+        .unwrap();
+        let values = if option == "--flash" {
+            options.flash
+        } else {
+            options.read
+        };
+        assert_eq!(values, ["boot", "path with spaces.bin"]);
+    }
+}
+
+#[test]
+fn flash_stdin_conflicts_fail_before_input_or_device_access() {
+    for arguments in [
+        vec!["--auto", "--flash", "boot", "-", "--fda", "-"],
+        vec!["--auto", "--flash", "boot", "-", "--emmc1", "-"],
+        vec!["--auto", "--flash", "boot", "-", "--flash", "system", "-"],
+    ] {
+        let result = cargo_bin_cmd!("sddownload")
+            .args(arguments)
+            .timeout(Duration::from_secs(3))
+            .assert()
+            .code(1);
+        let error = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(
+            error.contains("stdin can only be used for one input"),
+            "{error}"
+        );
+        assert!(!error.contains("ADB auto-reboot"));
+        assert!(!error.contains("Staging flash image"));
+    }
+}
+
+#[test]
+fn empty_flash_stdin_and_multiple_stdout_reads_fail_before_usb() {
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--auto", "--flash", "boot", "-"])
+        .write_stdin(b"")
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("flash image from stdin is empty"), "{error}");
+    assert!(!error.contains("ADB auto-reboot"));
+    assert!(result.get_output().stdout.is_empty());
+
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--auto", "--read", "boot", "-", "--read", "system", "-"])
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(
+        error.contains("stdout can only be used for one --read output"),
+        "{error}"
+    );
+    assert!(!error.contains("ADB auto-reboot"));
+    assert!(result.get_output().stdout.is_empty());
 }
 
 #[test]

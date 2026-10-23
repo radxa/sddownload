@@ -541,12 +541,57 @@ fn input(path: &Path) -> Result<Box<dyn Read>> {
     }
 }
 
+fn stage_flash_stdin(
+    source: &mut dyn Read,
+    directory: &Path,
+    debug: bool,
+) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("flash-stdin-")
+        .disable_cleanup(debug)
+        .tempfile_in(directory)?;
+    eprintln!("Staging flash image from stdin");
+    if debug {
+        eprintln!("Flash stdin cache file: {}", file.path().display());
+    }
+    ensure!(
+        io::copy(source, &mut file)? > 0,
+        "flash image from stdin is empty"
+    );
+    file.flush()?;
+    Ok(file)
+}
+
+fn read_to_stdout<T: usb::BulkTransport>(
+    client: &mut sdeasyboot::fastboot::FastbootClient<T>,
+    partition: &str,
+) -> Result<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        // File uses the inherited binary handle, avoiding console text handling.
+        let mut output = File::from(io::stdout().as_handle().try_clone_to_owned()?);
+        client.readback_to(partition, &mut output)
+    }
+    #[cfg(not(windows))]
+    client.readback_to(partition, &mut io::stdout().lock())
+}
+
 pub(super) fn download(
     options: &Cli,
     settings: &Config,
     actions: &Actions,
     directory: &Path,
 ) -> Result<()> {
+    let stdin_image = if actions.flash.iter().any(|(_, path)| path == Path::new("-")) {
+        Some(stage_flash_stdin(
+            &mut input(Path::new("-"))?,
+            directory,
+            options.debug,
+        )?)
+    } else {
+        None
+    };
     let (_target, empty) = stream_inputs(
         options,
         settings,
@@ -574,14 +619,25 @@ pub(super) fn download(
                 {
                     client.erase(partition)?;
                 }
-                let mut file = File::open(path)?;
+                let mut file = if path == Path::new("-") {
+                    stdin_image
+                        .as_ref()
+                        .context("missing staged flash stdin")?
+                        .reopen()?
+                } else {
+                    File::open(path)?
+                };
                 let size = file.metadata()?.len();
                 flash_with_progress(client, partition, &mut file, size, !options.skip_verify)
             })?;
         }
-        for (partition, path, _) in &actions.read {
+        for (partition, path) in &actions.read {
             with_fastboot(options, settings.timeout(partition), |client| {
-                client.readback(partition, path)
+                if path == Path::new("-") {
+                    read_to_stdout(client, partition)
+                } else {
+                    client.readback(partition, path)
+                }
             })?;
         }
     }
@@ -803,6 +859,44 @@ mod tests {
         crc.update(&bytes[1024..]);
         bytes[1020..1024].copy_from_slice(&crc.finalize().to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn flash_stdin_stages_binary_image_and_flashes_exact_payload() {
+        use std::collections::VecDeque;
+        struct FastbootPeer {
+            responses: VecDeque<Vec<u8>>,
+            writes: Vec<Vec<u8>>,
+        }
+        impl usb::BulkTransport for FastbootPeer {
+            fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+                let bytes = self.responses.pop_front().context("missing response")?;
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+                self.writes.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"a\0\r\n\x1a\xff\x80z";
+        let file = stage_flash_stdin(&mut bytes.as_slice(), directory.path(), false).unwrap();
+        let mut client = sdeasyboot::fastboot::FastbootClient::new(FastbootPeer {
+            responses: [
+                b"OKAY0x8".to_vec(),
+                b"DATA00000008".to_vec(),
+                b"OKAY".to_vec(),
+                b"OKAY".to_vec(),
+            ]
+            .into(),
+            writes: vec![],
+        });
+        flash_with_progress(&mut client, "boot", &mut file.reopen().unwrap(), 8, false).unwrap();
+        assert_eq!(client.transport.writes[2], bytes);
+        assert_eq!(client.transport.writes[3], b"flash:boot");
+        drop(file);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]

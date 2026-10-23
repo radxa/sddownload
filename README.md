@@ -52,16 +52,16 @@ The existing long options retain their spelling, including underscores:
 --sn SERIAL      --b_part         --skip_verify    --verify-first
 --auto           --reboot         --debug
 --unpac_path DIRECTORY
---flash 'PARTITION|FILE'          (repeatable)
+--flash PARTITION PATH           (repeatable; - reads stdin)
 --erase 'PARTITION'               (repeatable)
---read 'PARTITION|FILE'            (repeatable)
+--read PARTITION PATH            (repeatable; - writes stdout)
 -h / --help
 ```
 
 Storage-specific PAC options use version 0. `--pac` uses version 1, the
 all-in-one format. The PAC library itself understands both versions and
-nested containers. Nonzero read/erase size suffixes are rejected for device
-operations because they belonged to the removed J-Link backend. Extraction
+nested containers. `--read` reads the whole named partition. Nonzero erase size
+suffixes are rejected for device operations because they belonged to the removed J-Link backend. Extraction
 does not invoke a device backend.
 
 Additional options:
@@ -107,8 +107,8 @@ Download through ROM/FDA and fastboot:
 
 ```sh
 sddownload --config /path/to/app.json --ospi1 ospi.pac --emmc1 emmc.pac
-sddownload --auto --flash 'emmc1$$spl|spl.img' --reboot
-sddownload --ospi1 ospi.pac --read 'emmc1$$ssystem|ssystem.bin'
+sddownload --auto --flash 'emmc1$$spl' spl.img --reboot
+sddownload --ospi1 ospi.pac --read 'emmc1$$ssystem' ssystem.bin
 ```
 
 Use single quotes to preserve literal dollar signs. The old backslash-dollar
@@ -129,16 +129,38 @@ PAC images or explicit flash operations, supply them in the same invocation:
 
 ```sh
 sddownload --fda fda.bin --emmc1 firmware.pac
-sddownload --fda fda.bin --flash 'emmc1$$kernel|kernel.img'
+sddownload --fda fda.bin --flash 'emmc1$$kernel' kernel.img
 ```
 
 `--fda` overrides every primary ROM FDA in the supplied PACs, including nested
 and later copies; other download agents retain their usual bootstrap order.
-Only one FDA or PAC input may use stdin. The raw FDA is staged in a temporary
+Only one FDA, PAC, or explicit flash input may use stdin. The raw FDA is staged in a temporary
 file to determine its size, so stdin must reach EOF before transfer starts.
 Empty and ELF FDA images are rejected before device access. `--verify-first`
 still validates all PAC CRCs before sending the FDA. `--fda` conflicts with the
 extraction-only `--unpac_path` option.
+
+`--flash` and `--read` each require two separate arguments, `PARTITION PATH`,
+and may be repeated for different partitions. Quote partition names containing
+dollar signs and paths containing spaces. The former `PARTITION|PATH` syntax
+is no longer accepted.
+
+Use `-` as the flash source for stdin, or as the readback destination for stdout:
+
+```sh
+zstd -dc kernel.img.zst | sddownload --fda fda.bin --flash 'emmc1$$kernel' -
+sddownload --fda fda.bin --read 'emmc1$$kernel' - > kernel.img
+sddownload --auto --flash 'emmc1$$boot' boot.img --flash 'emmc1$$system' system.img
+```
+
+A flash image from stdin is staged to disk before device access to determine
+its length; stdin must reach EOF before flashing begins. Only one input across
+FDA, PAC, and `--flash` can use stdin. Only one `--read` destination can use
+stdout. Readback to stdout is staged to disk and published only after its MD5
+and final device response are verified. Status and progress messages go to
+stderr when reading to stdout, keeping redirected output binary-clean. A failed
+verification publishes no readback bytes; an output write failure returns an
+error. File readbacks continue to use atomic replacement after verification.
 
 ## Streaming PAC downloads
 

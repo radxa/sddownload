@@ -6,7 +6,7 @@ use fastboot_protocol::protocol::{FastBootCommand, FastBootResponse};
 use md5::{Digest, Md5};
 use sdimage::sparse::StreamImage;
 use std::{
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::Path,
 };
 
@@ -311,6 +311,27 @@ impl<T: BulkTransport> FastbootClient<T> {
 
         ensure!(parent.is_dir(), "readback output parent does not exist");
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        let count = self.receive_readback(partition, temp.as_file_mut())?;
+        temp.persist(destination)
+            .map_err(|e| anyhow::anyhow!("publish readback: {}", e.error))?;
+        Ok(count)
+    }
+
+    /// Receive and verify a partition before writing anything to the output.
+    /// Uses temporary disk storage so stdout/pipes never receive corrupt data.
+    pub fn readback_to(&mut self, partition: &str, output: &mut impl Write) -> Result<u64> {
+        let mut temp = tempfile::tempfile()?;
+        let count = self.receive_readback(partition, &mut temp)?;
+        temp.rewind()?;
+        ensure!(
+            std::io::copy(&mut temp, output)? == count,
+            "truncated verified readback"
+        );
+        output.flush()?;
+        Ok(count)
+    }
+
+    fn receive_readback(&mut self, partition: &str, output: &mut impl Write) -> Result<u64> {
         self.send(&format!("read:{}:0:0", partition_name(partition)))?;
         let Response::Data(count) = self.response()? else {
             bail!("readback missing DATA response")
@@ -324,7 +345,7 @@ impl<T: BulkTransport> FastbootClient<T> {
             let n = self.transport.read(&mut buffer[..want])?;
 
             ensure!(n > 0 && n <= want, "invalid readback length");
-            temp.write_all(&buffer[..n])?;
+            output.write_all(&buffer[..n])?;
             digest.update(&buffer[..n]);
             remaining -= n as u64;
         }
@@ -342,9 +363,7 @@ impl<T: BulkTransport> FastbootClient<T> {
             matches!(self.response()?, Response::Okay(_)),
             "readback missing final OKAY"
         );
-        temp.flush()?;
-        temp.persist(destination)
-            .map_err(|e| anyhow::anyhow!("publish readback: {}", e.error))?;
+        output.flush()?;
 
         Ok(count)
     }
@@ -484,6 +503,66 @@ mod tests {
         ]));
         client.readback("x", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn readback_to_writer_preserves_binary_data_after_verification() {
+        let bytes = b"\0\r\n\x1a\xff\x80";
+        let md5 = format!("MD5{:x}", Md5::digest(bytes));
+        let mut client =
+            FastbootClient::new(peer(&[b"DATA00000006", bytes, md5.as_bytes(), b"OKAY"]));
+        let mut output = vec![];
+        assert_eq!(client.readback_to("boot", &mut output).unwrap(), 6);
+        assert_eq!(output, bytes);
+        assert_eq!(client.transport.writes, [b"read:boot:0:0".to_vec()]);
+    }
+
+    #[test]
+    fn readback_to_writer_publishes_nothing_on_md5_or_final_response_failure() {
+        for responses in [
+            vec![
+                b"DATA00000003".as_slice(),
+                b"abc",
+                b"MD500000000000000000000000000000000",
+                b"OKAY",
+            ],
+            vec![
+                b"DATA00000003".as_slice(),
+                b"abc",
+                b"MD5900150983cd24fb0d6963f7d28e17f72",
+                b"FAILread failed",
+            ],
+            vec![b"DATA00000003".as_slice(), b"ab"],
+        ] {
+            let mut client = FastbootClient::new(peer(&responses));
+            let mut output = b"unchanged".to_vec();
+            assert!(client.readback_to("boot", &mut output).is_err());
+            assert_eq!(output, b"unchanged");
+        }
+    }
+
+    #[test]
+    fn readback_to_writer_propagates_broken_pipe() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut client = FastbootClient::new(peer(&[
+            b"DATA00000003",
+            b"abc",
+            b"MD5900150983cd24fb0d6963f7d28e17f72",
+            b"OKAY",
+        ]));
+        let error = client.readback_to("boot", &mut BrokenPipe).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
