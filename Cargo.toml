@@ -18,6 +18,9 @@ tempfile = "3"
 sdimage = { path = "crates/sdimage" }
 sdeasyboot = { path = "crates/sdeasyboot" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2"
 

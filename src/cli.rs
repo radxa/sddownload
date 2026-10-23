@@ -53,7 +53,7 @@ pub struct Cli {
     /// Skip PAC CRC and flash MD5 verification.
     #[arg(long = "skip_verify")]
     pub skip_verify: bool,
-    /// Verify all PAC CRCs before device writes, caching payloads temporarily.
+    /// Validate PACs and select final loaders before device access; caches payloads.
     #[arg(long, conflicts_with = "skip_verify")]
     pub verify_first: bool,
     /// Try rebooting into download mode through ADB before connecting.

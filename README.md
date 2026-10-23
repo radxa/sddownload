@@ -125,31 +125,47 @@ curl -fL https://example.com/global.pac | sddownload --emmc1 -
 zstd -dc global.pac.zst | sddownload --emmc1 -
 ```
 
-Single-use payloads with known bootstrap dependencies flow directly to USB
-with bounded memory. Payloads
-that arrive before a required loader are cached in a temporary directory and
-replayed when ready. With `--b_part`, an A/B payload is cached while slot A is
-flashed, then replayed for slot B. Already cached payloads reuse the same file.
-If later nested PAC headers have not been read, transfers are deferred until
-their loader metadata is known. Some nested layouts therefore require caching
-most of their payloads before transfers can start. The last FDA/download agent
-of each kind is selected across inputs; superseded cached copies are discarded
-unless `--debug` retains them.
-When several PAC inputs are supplied, earlier inputs are staged so loaders
-from later inputs can run before their images. There is no configurable cache
-limit; temporary storage must have enough free space for deferred/reused data.
-Temporary files are removed after use, including on failure; `--debug` retains
-cached files and the working directory. The temporary directory follows the
-platform default (`TMPDIR` on Unix).
+On Unix (Linux and Darwin), normal mode uses a background input worker while
+the calling thread performs USB operations serially. The input worker parses
+headers, calculates CRCs, and continues reading/caching during FDA transfer,
+device initialization, and flashes. USB can read a growing cache file before
+the input worker finishes writing it: a `Caching ...` message does not mean
+that the entire file must be cached before flashing starts.
+
+When USB is ready, single-use payloads use a bounded in-memory pipe without a
+temporary file. At a payload boundary, when USB is busy or the payload must
+wait for a loader, input prefetch uses temporary cache files. The work queue and pipe buffers apply
+backpressure. With `--b_part`, an A/B payload is cached while slot A is flashed,
+then replayed for slot B; an already cached payload reuses its existing file.
+
+Normal mode commits to the first eligible FDA/download agent of each kind,
+without waiting for hypothetical replacements in unread nested headers. Known
+earlier bootstrap stages are still respected. A later byte-identical loader is
+ignored. A different replacement for an already selected loader, or a late
+loader requiring an earlier bootstrap stage, fails with a recommendation to
+use `--verify-first`. Later forward bootstrap stages (for example, an eMMC DA
+in a second PAC after an OSPI DA) can still run without replacing the FDA.
+
+There is no configurable cache limit; temporary storage must have enough free
+space for prefetched, deferred, and reused data. Payload caches are removed
+after use, including on I/O/protocol failure. Selected loader files are kept
+until completion to compare late copies byte for byte. `--debug` retains cache
+files and the working directory. The temporary directory follows the platform
+default (`TMPDIR` on Unix). Input cancellation also interrupts blocked Unix
+pipe reads when USB fails. In-flight USB calls retain their configured
+timeouts. Other platforms retain sequential scheduling.
 
 By default, CRCs are calculated as the input is consumed and checked when each
-PAC container ends. A CRC failure can therefore be reported after device
-writes have occurred. Failure returns a nonzero exit status and prevents the
-final requested reboot. Fastboot transfer MD5 verification remains enabled.
+PAC container ends. A CRC failure or late-loader conflict can therefore be
+reported after device writes have occurred. Failure stops further scheduling,
+returns a nonzero exit status, and prevents the final requested reboot.
+Fastboot transfer MD5 verification remains enabled.
 
 Use `--verify-first` to finish PAC CRC validation before any ADB/USB device
 operations. This stages the required payloads from all inputs in temporary
-files, then downloads them after validation:
+files and selects the last FDA/download agent of each kind, then downloads
+after validation. It retains the original global last-loader policy and does
+not use early bootstrap:
 
 ```sh
 zstd -dc global.pac.zst | sddownload --emmc1 - --verify-first
@@ -228,6 +244,11 @@ ELF32/ELF64 parsing, sparse expansion, raw ROM transfers, fastboot command
 framing, segmented transfers and MD5-verified readback. Native ADB
 authentication is exercised against a simulated USB peer with a temporary
 RSA key. Tests do not access real USB devices.
+
+Concurrency tests use controlled input and simulated USB targets to verify
+early FDA startup, input progress during boot, reads from growing caches,
+duplicate/conflicting late loaders, cancellation with an open input pipe, and
+cleanup after errors or a target panic.
 
 Synthetic tests and successful Nix builds do not establish hardware
 equivalence with every SemiDrive firmware version. No live flash, erase,

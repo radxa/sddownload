@@ -16,9 +16,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+mod pipeline;
+
 trait Target {
     fn connect(&mut self) -> Result<()>;
     fn is_rom(&self) -> bool;
+    #[cfg(unix)]
+    fn has_agent(&mut self) -> Result<bool> {
+        self.connect()?;
+        Ok(!self.is_rom())
+    }
     fn loader(&mut self, reader: &mut dyn Read, size: u64) -> Result<()>;
     fn bootstrap(&mut self, partition: &str, reader: &mut dyn Read, size: u64) -> Result<()>;
     fn flash(&mut self, partition: &str, reader: &mut dyn Read, size: u64) -> Result<()>;
@@ -29,6 +37,8 @@ struct UsbTarget<'a> {
     settings: &'a Config,
     rom: Option<bool>,
     dloader: Option<bool>,
+    #[cfg(unix)]
+    agent_loaded: bool,
 }
 
 impl<'a> UsbTarget<'a> {
@@ -38,6 +48,8 @@ impl<'a> UsbTarget<'a> {
             settings,
             rom: None,
             dloader: None,
+            #[cfg(unix)]
+            agent_loaded: false,
         })
     }
 
@@ -93,6 +105,12 @@ impl Target for UsbTarget<'_> {
         self.rom.unwrap_or(true)
     }
 
+    #[cfg(unix)]
+    fn has_agent(&mut self) -> Result<bool> {
+        self.connect()?;
+        Ok(!self.is_rom() && (self.agent_loaded || self.stage()?))
+    }
+
     fn loader(&mut self, reader: &mut dyn Read, size: u64) -> Result<()> {
         self.connect()?;
         if !self.is_rom() {
@@ -125,6 +143,12 @@ impl Target for UsbTarget<'_> {
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
             client.flash_reader(partition, reader, size, false)
         })?;
+        #[cfg(unix)]
+        {
+            if plan::is_da(partition) {
+                self.agent_loaded = true;
+            }
+        }
         if partition == "emmc1$da" {
             thread::sleep(Duration::from_secs(3));
         }
@@ -160,6 +184,19 @@ struct Cached {
     storage: String,
     entry: Entry,
     file: tempfile::TempPath,
+    #[cfg(unix)]
+    progress: Option<std::sync::Arc<pipeline::Progress>>,
+}
+
+impl Cached {
+    fn reader(&self) -> Result<Box<dyn Read + Send>> {
+        let file = File::open(&self.file)?;
+        #[cfg(unix)]
+        if let Some(progress) = &self.progress {
+            return Ok(Box::new(progress.reader(file)));
+        }
+        Ok(Box::new(file))
+    }
 }
 
 // Later PAC headers may contain a loader of any rank, including another FDA.
@@ -200,6 +237,8 @@ fn cache(
         storage: storage.into(),
         entry,
         file: file.into_temp_path(),
+        #[cfg(unix)]
+        progress: None,
     })
 }
 
@@ -295,7 +334,7 @@ impl<T: Target> Engine<'_, T> {
     }
 
     fn replay(&mut self, item: Cached) -> Result<()> {
-        let mut source = File::open(&item.file)?;
+        let mut source = item.reader()?;
         self.consume(&item.storage, &item.entry, &mut source, true)?;
         if loader(&item.entry).is_none()
             && self.wanted(&item.storage, &item.entry)
@@ -307,7 +346,7 @@ impl<T: Target> Engine<'_, T> {
                     "{}_b",
                     plan::storage_partition(&item.storage, &item.entry.partition)
                 ),
-                &mut File::open(&item.file)?,
+                &mut item.reader()?,
                 item.entry.size,
             )?;
         }
@@ -465,6 +504,20 @@ pub(super) fn download(
 }
 
 fn stream_inputs<T: Target>(
+    options: &Cli,
+    settings: &Config,
+    actions: &Actions,
+    directory: &Path,
+    target: T,
+) -> Result<(T, BTreeSet<String>)> {
+    #[cfg(unix)]
+    if !options.verify_first {
+        return pipeline::run(options, settings, actions, directory, target);
+    }
+    validated_inputs(options, settings, actions, directory, target)
+}
+
+fn validated_inputs<T: Target>(
     options: &Cli,
     settings: &Config,
     actions: &Actions,
@@ -634,7 +687,7 @@ mod tests {
         }
     }
 
-    fn packet(entries: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    pub(super) fn packet(entries: &[(&str, u32, &[u8])]) -> Vec<u8> {
         let mut bytes = vec![0; sdimage::pac::TABLE_END as usize];
         bytes[..4].copy_from_slice(&sdimage::pac::MAGIC.to_le_bytes());
         bytes[528..532].copy_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -676,14 +729,22 @@ mod tests {
                 directory: directory.path().into(),
                 ..Peer::default()
             };
-            let (peer, _) = stream_inputs(
+            let result = stream_inputs(
                 &options,
                 &Config::load(None).unwrap(),
                 &Actions::default(),
                 directory.path(),
                 peer,
-            )
-            .unwrap();
+            );
+            if !strict && cfg!(unix) {
+                let error = result.err().unwrap().to_string();
+                assert!(
+                    error.contains("late bootstrap loader") && error.contains("--verify-first")
+                );
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+                continue;
+            }
+            let (peer, _) = result.unwrap();
             assert_eq!(peer.calls[0], ("ospi1$da".into(), b"ospi".to_vec()));
             assert_eq!(peer.calls[1], ("emmc1$da".into(), b"emmc".to_vec()));
             assert_eq!(peer.calls[2].1, b"image");
@@ -728,14 +789,19 @@ mod tests {
                 directory: directory.path().into(),
                 ..Peer::default()
             };
-            let (peer, empty) = stream_inputs(
+            let result = stream_inputs(
                 &options,
                 &Config::load(None).unwrap(),
                 &Actions::default(),
                 directory.path(),
                 peer,
-            )
-            .unwrap();
+            );
+            if !strict && cfg!(unix) {
+                assert!(result.err().unwrap().to_string().contains("ELF FDA"));
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+                continue;
+            }
+            let (peer, empty) = result.unwrap();
             assert_eq!(
                 peer.calls,
                 [
@@ -781,8 +847,14 @@ mod tests {
             .err()
             .unwrap();
             assert!(error.to_string().contains("CRC mismatch"));
-            assert_eq!(received.get(), usize::from(!strict));
-            assert_eq!(connections.get() == 0, strict);
+            if strict {
+                assert_eq!(received.get(), 0);
+                assert_eq!(connections.get(), 0);
+            } else {
+                // The input worker can detect a tiny corrupt PAC before USB
+                // consumes it; normal mode permits, but does not require, writes.
+                assert!(received.get() <= 1);
+            }
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         }
     }
@@ -896,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_headers_defer_agents_and_select_the_last_copy() {
+    fn verify_first_nested_headers_select_the_last_copy() {
         let input_directory = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = input_directory.path().join("nested.pac");
@@ -915,8 +987,13 @@ mod tests {
             ]),
         )
         .unwrap();
-        let options =
-            Cli::try_parse_from(["sddownload", "--emmc1", path.to_str().unwrap()]).unwrap();
+        let options = Cli::try_parse_from([
+            "sddownload",
+            "--emmc1",
+            path.to_str().unwrap(),
+            "--verify-first",
+        ])
+        .unwrap();
         let (peer, _) = stream_inputs(
             &options,
             &Config::load(None).unwrap(),
@@ -941,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_loader_supersedes_a_staged_copy_from_an_earlier_input() {
+    fn verify_first_loader_supersedes_a_copy_from_an_earlier_input() {
         let input_directory = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let ospi = input_directory.path().join("ospi.pac");
@@ -958,6 +1035,7 @@ mod tests {
             ospi.to_str().unwrap(),
             "--emmc1",
             emmc.to_str().unwrap(),
+            "--verify-first",
         ])
         .unwrap();
         let (peer, _) = stream_inputs(
