@@ -23,6 +23,9 @@ mod streaming;
     about = "SemiDrive downloader"
 )]
 pub struct Cli {
+    /// Raw ROM FDA image, overriding PAC FDA images; use - for stdin.
+    #[arg(long, value_name = "PATH", conflicts_with = "unpac_path")]
+    pub fda: Option<PathBuf>,
     /// PAC image for the first OSPI storage device; use - for stdin.
     #[arg(long)]
     pub ospi1: Option<PathBuf>,
@@ -102,6 +105,20 @@ impl Actions {
 }
 
 impl Cli {
+    fn validate_stdin(&self) -> Result<()> {
+        let pac_stdin = self
+            .inputs()
+            .iter()
+            .filter(|(_, path)| *path == Path::new("-"))
+            .count();
+        let fda_stdin = usize::from(self.fda.as_deref() == Some(Path::new("-")));
+        ensure!(
+            pac_stdin + fda_stdin <= 1,
+            "stdin can only be used for one input (FDA or PAC)"
+        );
+        Ok(())
+    }
+
     pub fn inputs(&self) -> Vec<(&'static str, &Path)> {
         [
             ("ospi1", &self.ospi1),
@@ -119,9 +136,10 @@ impl Cli {
 
     fn actions(&self) -> Result<Actions> {
         ensure!(
-            self.automatic || !self.inputs().is_empty(),
-            "specify a PAC input or --auto"
+            self.fda.is_some() || self.automatic || !self.inputs().is_empty(),
+            "specify --fda, a PAC input, or --auto"
         );
+        self.validate_stdin()?;
 
         if let Some(output) = &self.unpac_path {
             ensure!(

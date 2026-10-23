@@ -57,6 +57,7 @@ fn supported_options_are_visible_and_removed_options_are_rejected() {
     let help = String::from_utf8_lossy(&output.get_output().stdout);
 
     for flag in [
+        "--fda",
         "--ospi1",
         "--ospi2",
         "--emmc1",
@@ -158,6 +159,80 @@ fn normal_stdin_elf_rejection_uses_binary_input_before_device_access() {
     let error = String::from_utf8_lossy(&result.get_output().stderr);
     assert!(error.contains("ELF FDA"), "{error}");
     assert!(!error.contains("ADB auto-reboot"));
+}
+
+#[test]
+fn explicit_fda_stdin_rejects_invalid_images_and_duplicate_stdin_before_usb() {
+    for strict in [false, true] {
+        for (bytes, expected) in [
+            (b"".as_slice(), "FDA image is empty"),
+            (b"\x7fELF\r\n\x1a\xff".as_slice(), "ELF FDA"),
+        ] {
+            let mut command = cargo_bin_cmd!("sddownload");
+            command.args(["--auto", "--fda", "-"]);
+            if strict {
+                command.arg("--verify-first");
+            }
+            let result = command
+                .write_stdin(bytes)
+                .timeout(Duration::from_secs(5))
+                .assert()
+                .code(1);
+            let error = String::from_utf8_lossy(&result.get_output().stderr);
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("ADB auto-reboot"), "{error}");
+        }
+    }
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--auto", "--fda", "-", "--emmc1", "-"])
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(
+        error.contains("stdin can only be used for one input"),
+        "{error}"
+    );
+    assert!(!error.contains("ADB auto-reboot"));
+    assert!(
+        Cli::try_parse_from(["sddownload", "--fda", "fda.bin", "--unpac_path", "out"]).is_err()
+    );
+}
+
+#[test]
+fn explicit_fda_file_or_stdin_keeps_verify_first_pac_validation_before_usb() {
+    let directory = tempfile::tempdir().unwrap();
+    let fda = directory.path().join("fda.bin");
+    let pac = directory.path().join("bad.pac");
+    fs::write(&fda, b"ROM").unwrap();
+    let mut bytes = packet(
+        0,
+        &[("FDA", 0, b"\x7fELFignored"), ("kernel", 6, b"image")],
+        true,
+    );
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&pac, &bytes).unwrap();
+    for fda_stdin in [false, true] {
+        let mut command = cargo_bin_cmd!("sddownload");
+        command.args(["--auto", "--verify-first", "--fda"]);
+        if fda_stdin {
+            command
+                .arg("-")
+                .arg("--emmc1")
+                .arg(&pac)
+                .write_stdin(b"ROM\r\n\x1a\xff");
+        } else {
+            command
+                .arg(&fda)
+                .args(["--emmc1", "-"])
+                .write_stdin(bytes.clone());
+        }
+        let result = command.timeout(Duration::from_secs(5)).assert().code(1);
+        let error = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(error.contains("CRC mismatch"), "{error}");
+        assert!(!error.contains("ELF FDA"), "{error}");
+        assert!(!error.contains("ADB auto-reboot"), "{error}");
+    }
 }
 
 #[test]

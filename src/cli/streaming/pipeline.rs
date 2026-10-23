@@ -251,6 +251,25 @@ fn produce(
 ) -> Result<()> {
     let mut empty = BTreeSet::new();
     let mut previous_direct = false;
+    if let Some(path) = &options.fda {
+        stop.check()?;
+        eprintln!("FDA image: {}", path.display());
+        let mut source =
+            open(path, stop).with_context(|| format!("open FDA {}", path.display()))?;
+        let fda = cache_fda(directory, options.debug, |writer| {
+            copy_entry(&mut source, stop, |bytes| {
+                Ok(write_cache(writer, bytes, stop)?)
+            })
+        })?;
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        sender
+            .send(Work::Entry {
+                payload: Payload::Cached(fda),
+                future: vec![],
+                unknown: false,
+            })
+            .map_err(|_| anyhow::anyhow!("USB worker stopped"))?;
+    }
     for (storage, path) in options.inputs() {
         stop.check()?;
         eprintln!("Streaming PAC: {}", path.display());
@@ -261,6 +280,9 @@ fn produce(
         );
         while let Some(entry) = pac.next_entry()? {
             stop.check()?;
+            if overridden_fda(options, &entry) {
+                continue;
+            }
             if loader(&entry).is_none()
                 && (!actions.is_empty()
                     || entry.kind == 1
@@ -270,6 +292,7 @@ fn produce(
             }
             let future: Vec<_> = pac
                 .pending_entries()
+                .filter(|entry| !overridden_fda(options, entry))
                 .filter_map(loader)
                 .map(|(rank, _)| rank)
                 .collect();
@@ -569,12 +592,12 @@ fn consume<T: Target>(
                 early.flush(&[], false)?;
                 ensure!(
                     early.engine.cached.is_empty(),
-                    "ROM mode requires an FDA image from a PAC"
+                    "ROM mode requires --fda or an FDA image from a PAC"
                 );
                 early.engine.target.connect()?;
                 ensure!(
                     !early.engine.target.is_rom(),
-                    "ROM mode requires an FDA image from a PAC"
+                    "ROM mode requires --fda or an FDA image from a PAC"
                 );
                 return Ok(empty);
             }
@@ -600,15 +623,7 @@ fn run_with_input<T: Target>(
     target: T,
     open: impl FnMut(&Path, &Arc<Stop>) -> Result<Box<dyn Read + Send>> + Send,
 ) -> Result<(T, BTreeSet<String>)> {
-    ensure!(
-        options
-            .inputs()
-            .iter()
-            .filter(|(_, path)| *path == Path::new("-"))
-            .count()
-            <= 1,
-        "stdin can only be used for one PAC input"
-    );
+    options.validate_stdin()?;
     let stop = Arc::new(Stop::default());
     let mode = Arc::new(AtomicU8::new(FLAT_READY));
     let in_flight = Arc::new(AtomicUsize::new(0));

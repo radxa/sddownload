@@ -52,6 +52,53 @@ fn interrupted_cache_write_checks_cancellation_before_retrying() {
     assert_eq!(writer.calls, 1);
 }
 
+#[test]
+fn explicit_fda_stdin_is_binary_and_precedes_pac_bootstrap() {
+    for with_pac in [false, true] {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        std::fs::write(
+            &path,
+            packet(&[
+                ("FDA", 0, b"ignored"),
+                ("da", 2, b"agent"),
+                ("kernel", 6, b"image"),
+            ]),
+        )
+        .unwrap();
+        let mut options = Cli::try_parse_from(["sddownload", "--fda", "-"]).unwrap();
+        if with_pac {
+            options.emmc1 = Some(path);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let peer = Peer {
+            rom: true,
+            cache: directory.path().into(),
+            ..Peer::default()
+        };
+        let bytes = b"ROM\0\r\n\x1a\xff";
+        let (peer, _) = run_with_input(
+            &options,
+            &Config::load(None).unwrap(),
+            &Actions::default(),
+            directory.path(),
+            peer,
+            |path, _| {
+                if path == Path::new("-") {
+                    Ok(Box::new(io::Cursor::new(bytes.to_vec())))
+                } else {
+                    Ok(Box::new(File::open(path)?))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(peer.calls[0], ("FDA".into(), bytes.to_vec()));
+        assert_eq!(peer.calls.len(), if with_pac { 3 } else { 1 });
+        assert!(!peer.rom);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_cancellation_retries_if_it_arrives_just_before_readfile() {

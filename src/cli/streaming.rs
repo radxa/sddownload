@@ -126,6 +126,11 @@ impl Target for UsbTarget<'_> {
         client.download_reader(reader, size)?;
         drop(client);
         thread::sleep(Duration::from_secs(3));
+        usb::wait_for_mode(
+            &self.options.sn,
+            self.settings.timeout("detect_dev"),
+            Mode::Fastboot,
+        )?;
         self.rom = Some(false);
         Ok(())
     }
@@ -157,7 +162,10 @@ impl Target for UsbTarget<'_> {
 
     fn flash(&mut self, partition: &str, reader: &mut dyn Read, size: u64) -> Result<()> {
         self.connect()?;
-        ensure!(!self.is_rom(), "ROM mode requires an FDA image from a PAC");
+        ensure!(
+            !self.is_rom(),
+            "ROM mode requires --fda or an FDA image from a PAC"
+        );
         self.stage()?;
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
             if partition.contains("partition") || partition.contains("emmc") {
@@ -192,6 +200,50 @@ fn loader(entry: &Entry) -> Option<(u8, &'static str)> {
         (2, true) => Some((4, "ssb_emmc1$da")),
         _ => None,
     }
+}
+
+fn overridden_fda(options: &Cli, entry: &Entry) -> bool {
+    options.fda.is_some() && loader(entry).is_some_and(|(rank, _)| rank == 0)
+}
+
+// A raw stdin FDA has no size header. Stage it to disk to determine its length
+// and reject empty/ELF input before any device access, without unbounded RAM.
+fn cache_fda(
+    directory: &Path,
+    debug: bool,
+    copy: impl FnOnce(&mut File) -> Result<u64>,
+) -> Result<Cached> {
+    let mut file = tempfile::Builder::new()
+        .prefix("fda-")
+        .disable_cleanup(debug)
+        .tempfile_in(directory)?;
+    if debug {
+        eprintln!("FDA cache file: {}", file.path().display());
+    }
+    let size = copy(file.as_file_mut())?;
+    ensure!(size > 0, "FDA image is empty");
+    file.flush()?;
+    let mut magic = [0; 4];
+    let count = size.min(4) as usize;
+    file.reopen()?.read_exact(&mut magic[..count])?;
+    ensure!(
+        count != 4 || magic != *b"\x7fELF",
+        "ELF FDA requires J-Link, which is not supported"
+    );
+    Ok(Cached {
+        storage: String::new(),
+        entry: Entry {
+            partition: "FDA".into(),
+            kind: 0,
+            size,
+            offset: 0,
+            slot_ab: false,
+            components: vec!["FDA.bin".into()],
+        },
+        file: file.into_temp_path(),
+        #[cfg(any(unix, windows))]
+        progress: None,
+    })
 }
 
 struct Cached {
@@ -289,10 +341,11 @@ struct Engine<'a, T> {
 
 impl<T: Target> Engine<'_, T> {
     fn wanted(&self, storage: &str, entry: &Entry) -> bool {
-        loader(entry).is_some()
-            || (self.actions.is_empty()
-                && entry.kind != 1
-                && !plan::is_boot(&plan::storage_partition(storage, &entry.partition)))
+        !overridden_fda(self.options, entry)
+            && (loader(entry).is_some()
+                || (self.actions.is_empty()
+                    && entry.kind != 1
+                    && !plan::is_boot(&plan::storage_partition(storage, &entry.partition))))
     }
 
     fn consume(
@@ -421,6 +474,9 @@ impl<T: Target> Engine<'_, T> {
         reader: &mut dyn Read,
         future: &[u8],
     ) -> Result<()> {
+        if overridden_fda(self.options, &entry) {
+            return self.flush(future);
+        }
         let mut before = future.to_vec();
         if let Some((rank, _)) = loader(&entry) {
             // Match the seekable plan: the last loader of each kind wins.
@@ -469,6 +525,14 @@ impl<T: Target> Engine<'_, T> {
 
 fn input(path: &Path) -> Result<Box<dyn Read>> {
     if path == Path::new("-") {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle;
+            return Ok(Box::new(File::from(
+                io::stdin().as_handle().try_clone_to_owned()?,
+            )));
+        }
+        #[cfg(not(windows))]
         Ok(Box::new(io::stdin()))
     } else {
         Ok(Box::new(
@@ -536,6 +600,7 @@ fn stream_inputs<T: Target>(
     directory: &Path,
     target: T,
 ) -> Result<(T, BTreeSet<String>)> {
+    options.validate_stdin()?;
     #[cfg(any(unix, windows))]
     if !options.verify_first {
         return pipeline::run(options, settings, actions, directory, target);
@@ -551,14 +616,7 @@ fn validated_inputs<T: Target>(
     target: T,
 ) -> Result<(T, BTreeSet<String>)> {
     let inputs = options.inputs();
-    ensure!(
-        inputs
-            .iter()
-            .filter(|(_, path)| *path == Path::new("-"))
-            .count()
-            <= 1,
-        "stdin can only be used for one PAC input"
-    );
+    options.validate_stdin()?;
     let mut engine = Engine {
         target,
         directory,
@@ -567,6 +625,18 @@ fn validated_inputs<T: Target>(
         cached: VecDeque::new(),
     };
     let mut empty = BTreeSet::new();
+    if let Some(path) = &options.fda {
+        eprintln!("FDA image: {}", path.display());
+        let mut source = input(path).with_context(|| format!("open FDA {}", path.display()))?;
+        let fda = cache_fda(directory, options.debug, |writer| {
+            Ok(io::copy(&mut source, writer)?)
+        })?;
+        if options.verify_first {
+            engine.cached.push_back(fda);
+        } else {
+            engine.replay(fda)?;
+        }
+    }
     for (index, (storage, path)) in inputs.iter().enumerate() {
         eprintln!("Streaming PAC: {}", path.display());
         let mut pac = PacStream::new(input(path)?, !options.skip_verify)?;
@@ -576,12 +646,11 @@ fn validated_inputs<T: Target>(
         );
         let stage = options.verify_first || index + 1 != inputs.len();
         while let Some(entry) = pac.next_entry()? {
+            if overridden_fda(options, &entry) {
+                continue;
+            }
             if stage {
-                if loader(&entry).is_some()
-                    || (actions.is_empty()
-                        && entry.kind != 1
-                        && !plan::is_boot(&plan::storage_partition(storage, &entry.partition)))
-                {
+                if engine.wanted(storage, &entry) {
                     defer(
                         &mut engine.cached,
                         cache(storage, entry, &mut pac, directory, options.debug)?,
@@ -590,6 +659,7 @@ fn validated_inputs<T: Target>(
             } else {
                 let mut future: Vec<_> = pac
                     .pending_entries()
+                    .filter(|entry| !overridden_fda(options, entry))
                     .filter_map(loader)
                     .map(|(rank, _)| rank)
                     .collect();
@@ -640,12 +710,12 @@ fn validated_inputs<T: Target>(
     engine.flush(&[])?;
     ensure!(
         engine.cached.is_empty(),
-        "ROM mode requires an FDA image from a PAC"
+        "ROM mode requires --fda or an FDA image from a PAC"
     );
     engine.target.connect()?;
     ensure!(
         !engine.target.is_rom(),
-        "ROM mode requires an FDA image from a PAC"
+        "ROM mode requires --fda or an FDA image from a PAC"
     );
     Ok((engine.target, empty))
 }
@@ -733,6 +803,175 @@ mod tests {
         crc.update(&bytes[1024..]);
         bytes[1020..1024].copy_from_slice(&crc.finalize().to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn explicit_fda_alone_bootstraps_without_pac_images() {
+        let input = tempfile::tempdir().unwrap();
+        let fda = input.path().join("rom.bin");
+        let bytes = b"ROM\0\r\n\x1a\xff";
+        std::fs::write(&fda, bytes).unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options =
+                Cli::try_parse_from(["sddownload", "--fda", fda.to_str().unwrap()]).unwrap();
+            options.verify_first = strict;
+            assert!(options.actions().unwrap().is_empty());
+            let peer = Peer {
+                rom: true,
+                directory: directory.path().into(),
+                ..Peer::default()
+            };
+            let (peer, empty) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &Actions::default(),
+                directory.path(),
+                peer,
+            )
+            .unwrap();
+            assert_eq!(peer.calls, [("FDA".into(), bytes.to_vec())]);
+            assert!(!peer.rom);
+            assert!(empty.is_empty());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn explicit_fda_overrides_all_primary_pac_loaders_including_nested_elf() {
+        let input = tempfile::tempdir().unwrap();
+        let fda = input.path().join("rom.bin");
+        let first = input.path().join("first.pac");
+        let second = input.path().join("second.pac");
+        std::fs::write(&fda, b"override").unwrap();
+        std::fs::write(&first, packet(&[("FDA", 0, b"old")])).unwrap();
+        let nested = packet(&[("FDA", 0, b"\x7fELFignored"), ("kernel", 6, b"image")]);
+        std::fs::write(
+            &second,
+            packet(&[
+                ("da", 2, b"agent"),
+                ("nested", 7, &nested),
+                ("FDA", 0, b"conflicting late FDA"),
+            ]),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Cli::try_parse_from([
+                "sddownload",
+                "--fda",
+                fda.to_str().unwrap(),
+                "--ospi1",
+                first.to_str().unwrap(),
+                "--emmc1",
+                second.to_str().unwrap(),
+            ])
+            .unwrap();
+            options.verify_first = strict;
+            let peer = Peer {
+                rom: true,
+                directory: directory.path().into(),
+                ..Peer::default()
+            };
+            let (peer, _) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &Actions::default(),
+                directory.path(),
+                peer,
+            )
+            .unwrap();
+            assert_eq!(
+                peer.calls,
+                [
+                    ("FDA".into(), b"override".to_vec()),
+                    ("emmc1$da".into(), b"agent".to_vec()),
+                    ("emmc1$nested$kernel".into(), b"image".to_vec()),
+                ]
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn explicit_fda_is_validated_before_any_device_access() {
+        let input = tempfile::tempdir().unwrap();
+        let fda = input.path().join("rom.bin");
+        for bytes in [b"".as_slice(), b"\x7fELFinvalid"] {
+            std::fs::write(&fda, bytes).unwrap();
+            for strict in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options =
+                    Cli::try_parse_from(["sddownload", "--fda", fda.to_str().unwrap()]).unwrap();
+                options.verify_first = strict;
+                let connections = Rc::new(Cell::new(0));
+                let peer = Peer {
+                    rom: true,
+                    directory: directory.path().into(),
+                    connections: connections.clone(),
+                    ..Peer::default()
+                };
+                let error = stream_inputs(
+                    &options,
+                    &Config::load(None).unwrap(),
+                    &Actions::default(),
+                    directory.path(),
+                    peer,
+                )
+                .err()
+                .unwrap();
+                assert!(
+                    error.to_string().contains(if bytes.is_empty() {
+                        "FDA image is empty"
+                    } else {
+                        "ELF FDA"
+                    }),
+                    "{error:#}"
+                );
+                assert_eq!(connections.get(), 0);
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn verify_first_bad_pac_crc_does_not_send_explicit_fda() {
+        let input = tempfile::tempdir().unwrap();
+        let fda = input.path().join("rom.bin");
+        let pac = input.path().join("bad.pac");
+        std::fs::write(&fda, b"override").unwrap();
+        let mut bytes = packet(&[("FDA", 0, b"ignored"), ("kernel", 6, b"image")]);
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&pac, bytes).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let options = Cli::try_parse_from([
+            "sddownload",
+            "--fda",
+            fda.to_str().unwrap(),
+            "--emmc1",
+            pac.to_str().unwrap(),
+            "--verify-first",
+        ])
+        .unwrap();
+        let connections = Rc::new(Cell::new(0));
+        let peer = Peer {
+            rom: true,
+            directory: directory.path().into(),
+            connections: connections.clone(),
+            ..Peer::default()
+        };
+        let error = stream_inputs(
+            &options,
+            &Config::load(None).unwrap(),
+            &Actions::default(),
+            directory.path(),
+            peer,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("CRC mismatch"), "{error:#}");
+        assert_eq!(connections.get(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]

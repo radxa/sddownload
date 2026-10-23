@@ -67,6 +67,7 @@ does not invoke a device backend.
 Additional options:
 
 ```text
+--fda PATH              Raw ROM FDA image; - reads stdin; overrides PAC FDA
 --config APP_JSON       Explicit application configuration file
 --adb-key PRIVATE_KEY   Explicit ADB RSA private-key file
 --version
@@ -113,6 +114,31 @@ sddownload --ospi1 ospi.pac --read 'emmc1$$ssystem|ssystem.bin'
 Use single quotes to preserve literal dollar signs. The old backslash-dollar
 partition spelling is also normalized. No shell interprets partition names.
 Flash, erase, reboot, and read operations interact with the connected device.
+
+Supply a raw FDA to enter download mode without a PAC:
+
+```sh
+sddownload --fda fda.bin
+cat fda.bin | sddownload --fda -
+```
+
+With no PAC or other operations, the command transfers the FDA if the device is
+in ROM mode, waits for fastboot download mode, and exits successfully. A device
+already in download mode does not need another FDA transfer. To continue with
+PAC images or explicit flash operations, supply them in the same invocation:
+
+```sh
+sddownload --fda fda.bin --emmc1 firmware.pac
+sddownload --fda fda.bin --flash 'emmc1$$kernel|kernel.img'
+```
+
+`--fda` overrides every primary ROM FDA in the supplied PACs, including nested
+and later copies; other download agents retain their usual bootstrap order.
+Only one FDA or PAC input may use stdin. The raw FDA is staged in a temporary
+file to determine its size, so stdin must reach EOF before transfer starts.
+Empty and ELF FDA images are rejected before device access. `--verify-first`
+still validates all PAC CRCs before sending the FDA. `--fda` conflicts with the
+extraction-only `--unpac_path` option.
 
 ## Streaming PAC downloads
 
