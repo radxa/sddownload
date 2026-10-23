@@ -125,6 +125,21 @@ curl -fL https://example.com/global.pac | sddownload --emmc1 -
 zstd -dc global.pac.zst | sddownload --emmc1 -
 ```
 
+Each flash operation reports a progress bar on stderr with flashed/total image
+size, recent USB transfer speed, and an estimated remaining time in `mm:ss`:
+
+```text
+Flash emmc1$rootfs [========        ]  50% 256.0 MiB/512.0 MiB 32.0 MiB/s ETA 00:08
+```
+
+The bar updates in place on a terminal; redirected stderr receives periodic
+lines. `--:--` means there is not enough progress to estimate the time yet.
+Sparse image sizes include skipped holes, while speed counts only transferred
+payload bytes. The estimate follows recent image progress and excludes unknown
+device-side write/verification delays. At 100%, the status remains `waiting for
+device` until the final response succeeds; failures are marked `failed`. A/B
+slots and explicit `--flash` images each get their own progress bar.
+
 On Linux, Darwin, and Windows, normal mode uses a background input worker while
 the calling thread performs USB operations serially. The input worker parses
 headers, calculates CRCs, and continues reading/caching during FDA transfer,

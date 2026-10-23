@@ -1,5 +1,5 @@
 //! Forward-only download scheduling. Only deferred/reused payloads are cached.
-use super::{with_fastboot, Actions, Cli};
+use super::{progress::FlashProgress, with_fastboot, Actions, Cli};
 use crate::{config::Config, plan};
 use anyhow::{ensure, Context, Result};
 use sdeasyboot::{
@@ -141,7 +141,7 @@ impl Target for UsbTarget<'_> {
         }
         eprintln!("Bootstrap {partition}");
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
-            client.flash_reader(partition, reader, size, false)
+            flash_with_progress(client, partition, reader, size, false)
         })?;
         #[cfg(any(unix, windows))]
         {
@@ -159,14 +159,28 @@ impl Target for UsbTarget<'_> {
         self.connect()?;
         ensure!(!self.is_rom(), "ROM mode requires an FDA image from a PAC");
         self.stage()?;
-        eprintln!("Flash {partition}");
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
             if partition.contains("partition") || partition.contains("emmc") {
                 client.erase(partition)?;
             }
-            client.flash_reader(partition, reader, size, !self.options.skip_verify)
+            flash_with_progress(client, partition, reader, size, !self.options.skip_verify)
         })
     }
+}
+
+fn flash_with_progress<T: usb::BulkTransport>(
+    client: &mut sdeasyboot::fastboot::FastbootClient<T>,
+    partition: &str,
+    reader: &mut dyn Read,
+    size: u64,
+    verify: bool,
+) -> Result<()> {
+    let mut progress = FlashProgress::new(partition);
+    let result = client.flash_reader_with_progress(partition, reader, size, verify, |state| {
+        progress.update(state);
+    });
+    progress.finish(result.is_ok());
+    result
 }
 
 fn loader(entry: &Entry) -> Option<(u8, &'static str)> {
@@ -496,7 +510,9 @@ pub(super) fn download(
                 {
                     client.erase(partition)?;
                 }
-                client.flash(partition, path, !options.skip_verify)
+                let mut file = File::open(path)?;
+                let size = file.metadata()?.len();
+                flash_with_progress(client, partition, &mut file, size, !options.skip_verify)
             })?;
         }
         for (partition, path, _) in &actions.read {

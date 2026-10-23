@@ -14,7 +14,15 @@ pub trait BulkTransport {
     fn write(&mut self, buffer: &[u8]) -> Result<usize>;
 }
 
-pub fn write_all(transport: &mut impl BulkTransport, mut bytes: &[u8]) -> Result<()> {
+pub fn write_all(transport: &mut impl BulkTransport, bytes: &[u8]) -> Result<()> {
+    write_all_with_progress(transport, bytes, |_| {})
+}
+
+pub(crate) fn write_all_with_progress(
+    transport: &mut impl BulkTransport,
+    mut bytes: &[u8],
+    mut progress: impl FnMut(u64),
+) -> Result<()> {
     while !bytes.is_empty() {
         let n = transport.write(&bytes[..bytes.len().min(0x4000)])?;
 
@@ -23,6 +31,7 @@ pub fn write_all(transport: &mut impl BulkTransport, mut bytes: &[u8]) -> Result
             "USB write made invalid progress"
         );
         bytes = &bytes[n..];
+        progress(n as u64);
     }
 
     Ok(())

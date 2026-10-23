@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+mod progress;
 mod streaming;
 
 #[derive(Clone, Debug, Parser)]

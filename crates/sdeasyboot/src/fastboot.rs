@@ -1,6 +1,6 @@
 //! Standard command/response types come from fastboot-protocol; SemiDrive's
 //! MD5/read/flash-seq extensions are layered over its standard codec.
-use crate::usb::{write_all, BulkTransport};
+use crate::usb::{write_all, write_all_with_progress, BulkTransport};
 use anyhow::{bail, ensure, Context, Result};
 use fastboot_protocol::protocol::{FastBootCommand, FastBootResponse};
 use md5::{Digest, Md5};
@@ -15,6 +15,16 @@ pub enum Response {
     Okay(String),
     Data(u64),
     Md5(String),
+}
+
+/// Flash transfer progress. Sparse holes count toward `completed` and `total`,
+/// but only payload bytes successfully written to USB count as `transferred`.
+/// Reaching `total` does not imply that the final device response has succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub transferred: u64,
 }
 
 #[derive(Debug)]
@@ -122,6 +132,16 @@ impl<T: BulkTransport> FastbootClient<T> {
     }
 
     pub fn download(&mut self, source: &mut impl Read, size: u64, verify: bool) -> Result<()> {
+        self.download_with_progress(source, size, verify, |_| {})
+    }
+
+    fn download_with_progress(
+        &mut self,
+        source: &mut impl Read,
+        size: u64,
+        verify: bool,
+        mut progress: impl FnMut(u64),
+    ) -> Result<()> {
         ensure!(
             size > 0 && size <= u32::MAX as u64,
             "invalid fastboot download size"
@@ -141,7 +161,7 @@ impl<T: BulkTransport> FastbootClient<T> {
             source
                 .read_exact(&mut buffer[..n])
                 .context("truncated image")?;
-            write_all(&mut self.transport, &buffer[..n])?;
+            write_all_with_progress(&mut self.transport, &buffer[..n], &mut progress)?;
             digest.update(&buffer[..n]);
             left -= n as u64;
         }
@@ -171,10 +191,29 @@ impl<T: BulkTransport> FastbootClient<T> {
         encoded_size: u64,
         verify: bool,
     ) -> Result<()> {
+        self.flash_reader_with_progress(partition, source, encoded_size, verify, |_| {})
+    }
+
+    /// Flash a forward-only image, reporting logical image position and actual
+    /// USB payload bytes. Callers should mark success only after this returns.
+    pub fn flash_reader_with_progress<R: Read + ?Sized>(
+        &mut self,
+        partition: &str,
+        source: &mut R,
+        encoded_size: u64,
+        verify: bool,
+        mut progress: impl FnMut(FlashProgress),
+    ) -> Result<()> {
         let partition = partition_name(partition);
         let mut image = StreamImage::new(source, encoded_size)?;
 
         ensure!(image.size > 0, "cannot flash an empty image");
+        let mut state = FlashProgress {
+            completed: 0,
+            total: image.size,
+            transferred: 0,
+        };
+        progress(state);
         let limit = match self.getvar("max-download-size") {
             Ok(s) => {
                 let s = s.rsplit(':').next().unwrap_or(&s).trim();
@@ -199,7 +238,11 @@ impl<T: BulkTransport> FastbootClient<T> {
         if !image.sparse && image.size <= limit {
             let size = image.size;
             image.next_segment()?;
-            self.download(&mut image, size, verify)?;
+            self.download_with_progress(&mut image, size, verify, |count| {
+                state.completed += count;
+                state.transferred += count;
+                progress(state);
+            })?;
             image.finish()?;
             self.command(&FastBootCommand::Flash(&partition).to_string())?;
 
@@ -209,13 +252,19 @@ impl<T: BulkTransport> FastbootClient<T> {
         let mut transferred = false;
         while let Some((start, size)) = image.next_segment()? {
             transferred = true;
+            state.completed = start;
+            progress(state);
             let mut offset = start;
             let mut left = size;
 
             while left > 0 {
                 let count = left.min(limit);
 
-                self.download(&mut image, count, verify)?;
+                self.download_with_progress(&mut image, count, verify, |count| {
+                    state.completed += count;
+                    state.transferred += count;
+                    progress(state);
+                })?;
                 self.send(&format!(
                     "flash-seq:{partition}:off{offset:x}/{:x}",
                     image.size
@@ -353,9 +402,27 @@ mod tests {
         let mut client =
             FastbootClient::new(peer(&[b"OKAY0x4", b"DATA00000003", b"OKAY", b"OKAY"]));
         let mut source = b"abcNEXT".as_slice();
+        let mut progress = vec![];
         client
-            .flash_reader("kernel", &mut source, 3, false)
+            .flash_reader_with_progress("kernel", &mut source, 3, false, |state| {
+                progress.push(state);
+            })
             .unwrap();
+        assert_eq!(
+            progress,
+            [
+                FlashProgress {
+                    completed: 0,
+                    total: 3,
+                    transferred: 0
+                },
+                FlashProgress {
+                    completed: 3,
+                    total: 3,
+                    transferred: 3
+                },
+            ]
+        );
         assert_eq!(source, b"NEXT");
         assert!(client.transport.writes.contains(&b"flash:kernel".to_vec()));
     }
@@ -369,8 +436,6 @@ mod tests {
 
     #[test]
     fn segmented_only_waits_on_final_flash() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), b"abcd").unwrap();
         let mut client = FastbootClient::new(peer(&[
             b"OKAY0x2",
             b"DATA00000002",
@@ -379,7 +444,23 @@ mod tests {
             b"OKAY",
             b"OKAY",
         ]));
-        client.flash("x", file.path(), false).unwrap();
+        let mut progress = vec![];
+        client
+            .flash_reader_with_progress("x", &mut &b"abcd"[..], 4, false, |state| {
+                progress.push(state);
+            })
+            .unwrap();
+        assert!(progress
+            .iter()
+            .any(|state| state.completed == 2 && state.transferred == 2));
+        assert_eq!(
+            progress.last(),
+            Some(&FlashProgress {
+                completed: 4,
+                total: 4,
+                transferred: 4
+            })
+        );
         assert!(client.transport.responses.is_empty());
         assert!(client
             .transport
@@ -455,7 +536,38 @@ mod tests {
             b"OKAY",
         ]));
 
-        client.flash("x", file.path(), true).unwrap();
+        let mut progress = vec![];
+        client
+            .flash_reader_with_progress(
+                "x",
+                &mut std::fs::File::open(file.path()).unwrap(),
+                file.as_file().metadata().unwrap().len(),
+                true,
+                |state| progress.push(state),
+            )
+            .unwrap();
+        assert_eq!(
+            progress.first(),
+            Some(&FlashProgress {
+                completed: 0,
+                total: 16,
+                transferred: 0
+            })
+        );
+        assert!(progress
+            .iter()
+            .any(|state| state.completed == 8 && state.transferred == 4));
+        assert_eq!(
+            progress.last(),
+            Some(&FlashProgress {
+                completed: 16,
+                total: 16,
+                transferred: 12
+            })
+        );
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].completed <= pair[1].completed));
 
         let writes = &client.transport.writes;
         assert!(writes.contains(&b"flash-seq:x:off0/10".to_vec()));
@@ -470,6 +582,72 @@ mod tests {
     fn extended_readback_lengths_are_64_bit() {
         let mut client = FastbootClient::new(peer(&[b"DATA100000000"]));
         assert_eq!(client.response().unwrap(), Response::Data(1u64 << 32));
+    }
+
+    #[test]
+    fn flash_progress_does_not_hide_final_device_failure_or_truncated_input() {
+        let mut client = FastbootClient::new(peer(&[
+            b"OKAY0x4",
+            b"DATA00000004",
+            b"OKAY",
+            b"FAILwrite failed",
+        ]));
+        let mut progress = vec![];
+        let error = client
+            .flash_reader_with_progress("x", &mut &b"abcd"[..], 4, false, |state| {
+                progress.push(state)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("write failed"));
+        assert_eq!(progress.last().unwrap().completed, 4);
+
+        let mut client = FastbootClient::new(peer(&[b"OKAY0x5", b"DATA00000005"]));
+        let mut progress = vec![];
+        assert!(client
+            .flash_reader_with_progress("x", &mut &b"abcd"[..], 5, false, |state| progress
+                .push(state),)
+            .is_err());
+        assert_eq!(progress.last().unwrap().completed, 0);
+        assert_eq!(progress.last().unwrap().transferred, 0);
+    }
+
+    #[test]
+    fn flash_progress_counts_partial_usb_writes_before_a_transport_error() {
+        struct PartialPeer(Peer);
+        impl BulkTransport for PartialPeer {
+            fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+                self.0.read(buffer)
+            }
+            fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+                match bytes {
+                    b"abcd" => self.0.write(b"a"),
+                    b"bcd" => bail!("USB disconnected"),
+                    _ => self.0.write(bytes),
+                }
+            }
+        }
+        let mut client = FastbootClient::new(PartialPeer(peer(&[b"OKAY0x4", b"DATA00000004"])));
+        let mut progress = vec![];
+        let error = client
+            .flash_reader_with_progress("x", &mut &b"abcd"[..], 4, false, |state| {
+                progress.push(state)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("USB disconnected"));
+        assert_eq!(
+            progress.last(),
+            Some(&FlashProgress {
+                completed: 1,
+                total: 4,
+                transferred: 1,
+            })
+        );
+        assert!(!client
+            .transport
+            .0
+            .writes
+            .iter()
+            .any(|bytes| bytes.starts_with(b"flash:")));
     }
 
     #[test]
