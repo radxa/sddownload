@@ -51,7 +51,7 @@ fn text(bytes: &[u8]) -> Result<String> {
         .to_owned())
 }
 
-fn valid_name(name: &str) -> Result<()> {
+pub(crate) fn valid_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0']),
         "unsafe PAC name: {name:?}"
@@ -60,7 +60,7 @@ fn valid_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn name_for(parents: &[String], leaf: &str, all: bool) -> String {
+pub(crate) fn name_for(parents: &[String], leaf: &str, all: bool) -> String {
     if parents.is_empty() {
         leaf.into()
     } else if all && parents.len() == 1 {

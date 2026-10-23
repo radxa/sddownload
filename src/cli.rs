@@ -1,22 +1,19 @@
-use crate::{
-    config::Config,
-    plan::{self, Plan},
-    size,
-};
+use crate::{config::Config, plan::Plan, size};
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use sdeasyboot::{
-    fastboot::{DeviceFailure, FastbootClient},
-    usb::{self, EasybootClient, Mode, UsbLink},
+    fastboot::FastbootClient,
+    usb::{self, Mode, UsbLink},
 };
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    thread,
     time::Duration,
 };
 
-#[derive(Debug, Parser)]
+mod streaming;
+
+#[derive(Clone, Debug, Parser)]
 #[command(
     name = "sddownload",
     version,
@@ -25,25 +22,25 @@ use std::{
     about = "SemiDrive downloader"
 )]
 pub struct Cli {
-    /// PAC image for the first OSPI storage device.
+    /// PAC image for the first OSPI storage device; use - for stdin.
     #[arg(long)]
     pub ospi1: Option<PathBuf>,
-    /// PAC image for the second OSPI storage device.
+    /// PAC image for the second OSPI storage device; use - for stdin.
     #[arg(long)]
     pub ospi2: Option<PathBuf>,
-    /// PAC image for eMMC storage.
+    /// PAC image for eMMC storage; use - for stdin.
     #[arg(long)]
     pub emmc1: Option<PathBuf>,
-    /// PAC image for SD card storage.
+    /// PAC image for SD card storage; use - for stdin.
     #[arg(long)]
     pub sd: Option<PathBuf>,
-    /// PAC image for SSD storage.
+    /// PAC image for SSD storage; use - for stdin.
     #[arg(long)]
     pub ssd: Option<PathBuf>,
-    /// All-in-one PAC image (version 1).
+    /// All-in-one PAC image (version 1); use - for stdin.
     #[arg(long)]
     pub pac: Option<PathBuf>,
-    /// PAC image for NVM storage.
+    /// PAC image for NVM storage; use - for stdin.
     #[arg(long)]
     pub nvm: Option<PathBuf>,
 
@@ -56,13 +53,16 @@ pub struct Cli {
     /// Skip PAC CRC and flash MD5 verification.
     #[arg(long = "skip_verify")]
     pub skip_verify: bool,
+    /// Verify all PAC CRCs before device writes, caching payloads temporarily.
+    #[arg(long, conflicts_with = "skip_verify")]
+    pub verify_first: bool,
     /// Try rebooting into download mode through ADB before connecting.
     #[arg(long = "auto")]
     pub automatic: bool,
     /// Reboot the device after successful operations.
     #[arg(long)]
     pub reboot: bool,
-    /// Print the download plan and keep temporary images.
+    /// Print diagnostics and retain temporary cached images.
     #[arg(long)]
     pub debug: bool,
     /// Extract PAC images to this directory without accessing USB.
@@ -197,130 +197,6 @@ fn with_fastboot<R>(
     operation(&mut client)
 }
 
-fn bootstrap(options: &Cli, settings: &Config, plan: &Plan) -> Result<()> {
-    if options.automatic {
-        let key = options
-            .adb_key
-            .clone()
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".android/adbkey"))
-            })
-            .context("set --adb-key when HOME is unavailable")?;
-
-        if let Err(error) =
-            sdeasyboot::adb::reboot_bootloader(&options.sn, &key, settings.timeout("detect_dev"))
-        {
-            eprintln!("ADB auto-reboot unavailable: {error:#}; detecting download mode directly");
-        }
-    }
-
-    let info = usb::wait_for(3, &options.sn, settings.timeout("detect_dev"))?;
-
-    if Mode::from_configuration_index(info.configuration_index) == Some(Mode::Rom) {
-        let loader = plan
-            .fda
-            .as_ref()
-            .context("ROM mode requires an FDA image from a PAC")?;
-        let mut easyboot = EasybootClient::new(UsbLink::open(info, settings.timeout("default"))?);
-
-        eprintln!("Downloading ROM FDA: {}", loader.display());
-        easyboot.download(loader)?;
-        drop(easyboot);
-
-        thread::sleep(Duration::from_secs(3));
-    }
-
-    let stage = with_fastboot(options, settings.timeout("get_stage"), |client| {
-        client.getvar("dev-stage")
-    });
-
-    let dloader = match stage {
-        Ok(stage) => stage.contains("dloader"),
-        Err(error) if error.downcast_ref::<DeviceFailure>().is_some() => false,
-        Err(error) => return Err(error.context("query fastboot stage")),
-    };
-
-    for image in &plan.images {
-        if (plan::is_da(&image.partition) && !dloader) || plan::is_ssb(&image.partition) {
-            eprintln!("Bootstrap {}", image.partition);
-
-            with_fastboot(options, settings.timeout(&image.partition), |client| {
-                client.flash(&image.partition, &image.path, false)
-            })?;
-
-            if image.partition == "emmc1$da" {
-                thread::sleep(Duration::from_secs(3));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn usb_download(options: &Cli, settings: &Config, plan: &Plan, actions: &Actions) -> Result<()> {
-    bootstrap(options, settings, plan)?;
-
-    if actions.is_empty() {
-        for image in &plan.images {
-            if plan::is_da(&image.partition)
-                || plan::is_ssb(&image.partition)
-                || plan::is_boot(&image.partition)
-            {
-                continue;
-            }
-
-            eprintln!("Flash {}", image.partition);
-
-            with_fastboot(options, settings.timeout(&image.partition), |client| {
-                if image.partition.contains("partition") || image.partition.contains("emmc") {
-                    client.erase(&image.partition)?;
-                }
-
-                client.flash(&image.partition, &image.path, !options.skip_verify)
-            })?;
-        }
-
-        for partition in &plan.auto_erase {
-            with_fastboot(options, settings.timeout("default"), |client| {
-                client.erase(partition)
-            })?;
-        }
-    } else {
-        for (partition, _) in &actions.erase {
-            with_fastboot(options, settings.timeout("default"), |client| {
-                client.erase(partition)
-            })?;
-        }
-
-        for (partition, path) in &actions.flash {
-            with_fastboot(options, settings.timeout(partition), |client| {
-                if partition.contains("partition")
-                    || partition.contains("emmc")
-                    || partition.contains("ssd")
-                {
-                    client.erase(partition)?;
-                }
-
-                client.flash(partition, path, !options.skip_verify)
-            })?;
-        }
-
-        for (partition, path, _) in &actions.read {
-            with_fastboot(options, settings.timeout(partition), |client| {
-                client.readback(partition, path)
-            })?;
-        }
-    }
-
-    if options.reboot {
-        with_fastboot(options, settings.timeout("default"), |client| {
-            client.reboot()
-        })?;
-    }
-
-    Ok(())
-}
-
 pub fn execute(options: &Cli) -> Result<()> {
     let actions = options.actions()?;
     let settings = Config::load(options.config.as_deref())?;
@@ -342,32 +218,44 @@ pub fn execute(options: &Cli) -> Result<()> {
         Temporary::Owned(temporary)
     };
 
-    let plan = Plan::prepare(options, &settings, temporary.path())?;
+    if options.unpac_path.is_none() {
+        streaming::download(options, &settings, &actions, temporary.path())?;
+        println!("Download successfully");
+        return Ok(());
+    }
+
+    let mut extraction = options.clone();
+    let stdin_inputs = extraction
+        .inputs()
+        .iter()
+        .filter(|(_, path)| *path == Path::new("-"))
+        .count();
+    ensure!(
+        stdin_inputs <= 1,
+        "stdin can only be used for one PAC input"
+    );
+    for input in [
+        &mut extraction.ospi1,
+        &mut extraction.ospi2,
+        &mut extraction.emmc1,
+        &mut extraction.sd,
+        &mut extraction.ssd,
+        &mut extraction.pac,
+        &mut extraction.nvm,
+    ] {
+        if input.as_deref() == Some(Path::new("-")) {
+            let path = temporary.path().join("stdin.pac");
+            std::io::copy(&mut std::io::stdin(), &mut std::fs::File::create(&path)?)?;
+            *input = Some(path);
+        }
+    }
+    let plan = Plan::prepare(&extraction, &settings, temporary.path())?;
 
     if options.debug {
         eprintln!("Download plan: {plan:#?}");
     }
 
-    if options.unpac_path.is_some() {
-        println!("Unpac successfully");
-
-        return Ok(());
-    }
-
-    let elf_loader = plan
-        .fda
-        .as_ref()
-        .map(sdimage::elf::Loader::is_elf)
-        .transpose()?
-        .unwrap_or(false);
-
-    ensure!(
-        !elf_loader,
-        "ELF FDA requires J-Link, which is not supported; use --unpac_path to extract it"
-    );
-
-    usb_download(options, &settings, &plan, &actions)?;
-    println!("Download successfully");
+    println!("Unpac successfully");
 
     Ok(())
 }

@@ -5,9 +5,10 @@ fastboot, checksums, image handling, and ADB authentication run in process.
 The program does not launch the bundled Python, easyboot, fastboot, or adb
 executables.
 
-J-Link support is intentionally omitted. PACs containing ELF FDA loaders can
-be extracted and inspected, but cannot be downloaded by this program. They
-are rejected before USB discovery or ADB reboot. No SEGGER SDK is needed.
+J-Link support is intentionally omitted. PACs can be extracted and inspected,
+but downloads whose selected FDA loader is ELF are rejected. Use
+`--verify-first` to detect unsupported loaders before USB
+discovery or ADB reboot. No SEGGER SDK is needed.
 
 ## Build with Nix
 
@@ -48,7 +49,7 @@ The existing long options retain their spelling, including underscores:
 ```text
 --ospi1 FILE     --ospi2 FILE     --emmc1 FILE
 --sd FILE        --ssd FILE       --pac FILE       --nvm FILE
---sn SERIAL      --b_part         --skip_verify
+--sn SERIAL      --b_part         --skip_verify    --verify-first
 --auto           --reboot         --debug
 --unpac_path DIRECTORY
 --flash 'PARTITION|FILE'          (repeatable)
@@ -78,7 +79,7 @@ detection, 20-second stage/DA operations, a 400-second default operation
 timeout, and automatic erasure of empty `exception_log`/`misc` partitions.
 Explicit JSON values override these defaults. A timeout of zero disables
 that timeout. Legacy `settings`/`log` fields are accepted; `--debug` controls
-Rust's retained extraction data and download-plan diagnostics.
+Rust's diagnostics and retention of temporary cached images.
 
 Example configuration:
 
@@ -113,6 +114,53 @@ Use single quotes to preserve literal dollar signs. The old backslash-dollar
 partition spelling is also normalized. No shell interprets partition names.
 Flash, erase, reboot, and read operations interact with the connected device.
 
+## Streaming PAC downloads
+
+Downloads consume PAC input in one forward pass, reading payloads directly
+instead of extracting every image first. Every PAC input option accepts `-`
+for stdin; only one input may use stdin:
+
+```sh
+curl -fL https://example.com/global.pac | sddownload --emmc1 -
+zstd -dc global.pac.zst | sddownload --emmc1 -
+```
+
+Single-use payloads with known bootstrap dependencies flow directly to USB
+with bounded memory. Payloads
+that arrive before a required loader are cached in a temporary directory and
+replayed when ready. With `--b_part`, an A/B payload is cached while slot A is
+flashed, then replayed for slot B. Already cached payloads reuse the same file.
+If later nested PAC headers have not been read, transfers are deferred until
+their loader metadata is known. Some nested layouts therefore require caching
+most of their payloads before transfers can start. The last FDA/download agent
+of each kind is selected across inputs; superseded cached copies are discarded
+unless `--debug` retains them.
+When several PAC inputs are supplied, earlier inputs are staged so loaders
+from later inputs can run before their images. There is no configurable cache
+limit; temporary storage must have enough free space for deferred/reused data.
+Temporary files are removed after use, including on failure; `--debug` retains
+cached files and the working directory. The temporary directory follows the
+platform default (`TMPDIR` on Unix).
+
+By default, CRCs are calculated as the input is consumed and checked when each
+PAC container ends. A CRC failure can therefore be reported after device
+writes have occurred. Failure returns a nonzero exit status and prevents the
+final requested reboot. Fastboot transfer MD5 verification remains enabled.
+
+Use `--verify-first` to finish PAC CRC validation before any ADB/USB device
+operations. This stages the required payloads from all inputs in temporary
+files, then downloads them after validation:
+
+```sh
+zstd -dc global.pac.zst | sddownload --emmc1 - --verify-first
+```
+
+`--verify-first` conflicts with `--skip_verify`, which disables PAC CRC and
+flash MD5 checks. Unset PAC CRC fields remain optional in both policies.
+`--unpac_path` still explicitly extracts files; stdin is first staged to a
+temporary PAC for that mode. Streaming traversal orders entries by physical
+offset and rejects overlapping entries.
+
 ADB uses a direct authenticated USB connection through `libadb`. Its default
 key is `~/.android/adbkey`; a new private key is created with mode 0600 when
 needed. The usual device authorization dialog may appear. A running ADB
@@ -122,8 +170,8 @@ SDK's udev rules. This program does not modify system udev configuration.
 
 ## Libraries and protocol
 
-* `sdimage`: streaming PAC parsing/CRC validation and extraction, a seekable
-  expanded Android sparse-image reader, ELF32/ELF64 loader inspection.
+* `sdimage`: PAC parsing/CRC validation and extraction, forward-only PAC and
+  sparse-image readers, a seekable sparse-image reader, ELF32/ELF64 inspection.
   Uses `crc`, `md-5`, and `object`.
 * `sdeasyboot`: raw ROM easyboot, extended fastboot, USB discovery, and native
   ADB reboot. Uses `rusb`, `fastboot-protocol`, and `libadb`. `BulkTransport`
@@ -164,6 +212,12 @@ Inspect PAC metadata through the library:
 
 ```sh
 cargo run --example inspect_pac -- firmware.pac
+```
+
+Inspect and CRC-check a forward-only stream without accessing USB:
+
+```sh
+zstd -dc firmware.pac.zst | cargo run --release --example stream_pac -- -
 ```
 
 ## Verification boundary

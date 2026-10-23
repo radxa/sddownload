@@ -313,6 +313,10 @@ impl<T: BulkTransport> EasybootClient<T> {
 
         let size = file.metadata()?.len();
 
+        self.download_reader(&mut file, size)
+    }
+
+    pub fn download_reader<R: Read + ?Sized>(&mut self, source: &mut R, size: u64) -> Result<u64> {
         ensure!(size > 0, "ROM loader is empty");
 
         let mut buffer = vec![0; 0x4000];
@@ -321,7 +325,8 @@ impl<T: BulkTransport> EasybootClient<T> {
         while remaining != 0 {
             let count = remaining.min(buffer.len() as u64) as usize;
 
-            file.read_exact(&mut buffer[..count])
+            source
+                .read_exact(&mut buffer[..count])
                 .context("ROM loader was truncated")?;
             write_all(&mut self.transport, &buffer[..count])?;
 

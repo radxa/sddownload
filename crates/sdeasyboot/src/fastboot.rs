@@ -4,9 +4,9 @@ use crate::usb::{write_all, BulkTransport};
 use anyhow::{bail, ensure, Context, Result};
 use fastboot_protocol::protocol::{FastBootCommand, FastBootResponse};
 use md5::{Digest, Md5};
-use sdimage::sparse::Image;
+use sdimage::sparse::StreamImage;
 use std::{
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::Path,
 };
 
@@ -159,8 +159,20 @@ impl<T: BulkTransport> FastbootClient<T> {
     }
 
     pub fn flash(&mut self, partition: &str, path: &Path, verify: bool) -> Result<()> {
+        let mut file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        self.flash_reader(partition, &mut file, size, verify)
+    }
+
+    pub fn flash_reader<R: Read + ?Sized>(
+        &mut self,
+        partition: &str,
+        source: &mut R,
+        encoded_size: u64,
+        verify: bool,
+    ) -> Result<()> {
         let partition = partition_name(partition);
-        let mut image = Image::open(path)?;
+        let mut image = StreamImage::new(source, encoded_size)?;
 
         ensure!(image.size > 0, "cannot flash an empty image");
         let limit = match self.getvar("max-download-size") {
@@ -186,24 +198,23 @@ impl<T: BulkTransport> FastbootClient<T> {
 
         if !image.sparse && image.size <= limit {
             let size = image.size;
+            image.next_segment()?;
             self.download(&mut image, size, verify)?;
+            image.finish()?;
             self.command(&FastBootCommand::Flash(&partition).to_string())?;
 
             return Ok(());
         }
 
-        let ranges = image.transfer_ranges();
-
-        ensure!(!ranges.is_empty(), "image contains no transferable data");
-
-        for (start, size) in ranges {
+        let mut transferred = false;
+        while let Some((start, size)) = image.next_segment()? {
+            transferred = true;
             let mut offset = start;
             let mut left = size;
 
             while left > 0 {
                 let count = left.min(limit);
 
-                image.seek(SeekFrom::Start(offset))?;
                 self.download(&mut image, count, verify)?;
                 self.send(&format!(
                     "flash-seq:{partition}:off{offset:x}/{:x}",
@@ -224,6 +235,9 @@ impl<T: BulkTransport> FastbootClient<T> {
                 left -= count;
             }
         }
+
+        image.finish()?;
+        ensure!(transferred, "image contains no transferable data");
 
         Ok(())
     }
@@ -332,6 +346,18 @@ mod tests {
                 b"md5:900150983cd24fb0d6963f7d28e17f72".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn forward_flash_reader_leaves_the_next_payload_unread() {
+        let mut client =
+            FastbootClient::new(peer(&[b"OKAY0x4", b"DATA00000003", b"OKAY", b"OKAY"]));
+        let mut source = b"abcNEXT".as_slice();
+        client
+            .flash_reader("kernel", &mut source, 3, false)
+            .unwrap();
+        assert_eq!(source, b"NEXT");
+        assert!(client.transport.writes.contains(&b"flash:kernel".to_vec()));
     }
 
     #[test]

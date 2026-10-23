@@ -67,6 +67,7 @@ fn supported_options_are_visible_and_removed_options_are_rejected() {
         "--sn",
         "--b_part",
         "--skip_verify",
+        "--verify-first",
         "--auto",
         "--reboot",
         "--debug",
@@ -116,6 +117,33 @@ fn repeated_scalar_options_override_and_actions_append() {
     assert_eq!(options.ospi1.unwrap(), Path::new("override.pac"));
     assert_eq!(options.sn, "second");
     assert_eq!(options.flash, ["one|one.bin", "two|two.bin"]);
+}
+
+#[test]
+fn stdin_extraction_and_verify_first_reject_bad_crc_without_usb() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("images");
+    let mut bytes = packet(0, &[("kernel", 6, b"payload")], true);
+    cargo_bin_cmd!("sddownload")
+        .args(["--emmc1", "-", "--unpac_path"])
+        .arg(&output)
+        .write_stdin(bytes.clone())
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    assert_eq!(fs::read(output.join("kernel.bin")).unwrap(), b"payload");
+    *bytes.last_mut().unwrap() ^= 1;
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--auto", "--emmc1", "-", "--verify-first"])
+        .write_stdin(bytes)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("CRC mismatch"));
+    assert!(!error.contains("ADB auto-reboot"));
+    assert!(Cli::try_parse_from(["sddownload", "--verify-first", "--skip_verify"]).is_err());
+    assert!(sddownload::cli::run_from(["sddownload", "--emmc1", "-", "--ospi1", "-"]) != 0);
 }
 
 #[test]

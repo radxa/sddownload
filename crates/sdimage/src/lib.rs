@@ -1,6 +1,7 @@
 pub mod elf;
 pub mod pac;
 pub mod sparse;
+pub mod stream;
 
 use anyhow::Result;
 use md5::{Digest, Md5};
