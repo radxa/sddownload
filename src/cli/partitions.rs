@@ -3,7 +3,10 @@
 use super::{listing_table::write_table, streaming, with_fastboot, Cli};
 use crate::{config::Config, plan};
 use anyhow::{ensure, Context, Result};
-use sdimage::stream::{PacStream, Resource};
+use sdimage::{
+    pac::PacFileType,
+    stream::{PacStream, Resource},
+};
 use std::{
     fs::File,
     io::{self, Read, Write},
@@ -22,8 +25,10 @@ fn resource_row(storage: &str, resource: Resource) -> Vec<String> {
         "PAC container"
     } else {
         match resource.kind {
-            0 => "FDA (bootstrap; not a partition)",
-            1 | 2 => "download agent (bootstrap; not a partition)",
+            PacFileType::Fda => "FDA (bootstrap; not a partition)",
+            PacFileType::OspiDa | PacFileType::Dloader => {
+                "download agent (bootstrap; not a partition)"
+            }
             _ => "image",
         }
     };

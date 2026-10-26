@@ -1,6 +1,9 @@
 //! Forward-only PAC traversal and seekable metadata inspection. Payloads are
 //! read for checksum verification; unchecked seekable inspection skips them.
-use crate::{pac::Entry, BZIP2};
+use crate::{
+    pac::{Entry, PacFileType},
+    BZIP2,
+};
 use anyhow::{ensure, Context, Result};
 use std::{
     collections::VecDeque,
@@ -19,7 +22,7 @@ struct Item {
 pub struct Resource {
     pub name: String,
     pub size: u64,
-    pub kind: u32,
+    pub kind: PacFileType,
     pub container: bool,
 }
 
@@ -214,8 +217,8 @@ impl<R: Read> PacStream<R> {
             let mut name = text(&row[..72])?;
             super::pac::valid_name(&name)?;
             let size = long(row, 72);
-            let kind = word(row, 88);
-            let container = kind == 7 || (parents.is_empty() && version == 1);
+            let kind = PacFileType::from(word(row, 88));
+            let container = kind == PacFileType::Pac || (parents.is_empty() && version == 1);
             let resource_components = if self.collect_resources {
                 self.resources.push(Resource {
                     name: super::pac::name_for(&resource_parents, &name, self.version == 1),
@@ -496,7 +499,7 @@ pub(crate) mod tests {
             ]
         );
         assert!(pac.resources[0].container);
-        assert_eq!(pac.resources[3].kind, 0);
+        assert_eq!(pac.resources[3].kind, PacFileType::Fda);
         assert_eq!(pac.resources[4].size, 0);
 
         let mut normal = PacStream::new(bytes.as_slice(), true).unwrap();

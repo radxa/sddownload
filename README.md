@@ -197,7 +197,14 @@ PAC output uses aligned, space-padded columns: `RESOURCE`, `IMAGE_BYTES`, `KIND`
 and `NOTES`. The source path and input option appear once above each PAC's table;
 multiple PAC inputs get separate tables, so there is no repeated `SOURCE`
 column. `IMAGE_BYTES` is the encoded payload length, not device partition
-capacity, and `KIND` is the numeric type stored in the PAC table.
+capacity. `KIND` shows the friendly `PAC_FILE_TYPE` name from the SDK's
+`src/unpac.py` together with its numeric value, such as `FDA (0)`, `SPL (3)`,
+`GPT (5)`, or `IMG (6)`. Unknown values are shown as `UNKNOWN (number)`.
+The Rust `sdimage::pac::PacFileType` enum mirrors every Python enum value. PAC
+entries and resource metadata carry this enum, and parsing, bootstrap selection,
+and listing use its variants rather than raw numeric type checks. Unknown IDs
+remain available as `PacFileType::Unknown(id)`; `.raw()` returns the on-disk ID.
+Listing does not need Python at runtime.
 
 All resources recorded in the PAC are included: images such as SPL, FDA and
 download agents, nested PAC containers, empty entries, and repeated resources.

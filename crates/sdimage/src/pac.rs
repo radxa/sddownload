@@ -11,14 +11,118 @@ use std::{
 pub const MAGIC: u32 = 0x5041_434b;
 pub const TABLE_END: u64 = 17_408;
 
+/// PAC_FILE_TYPE from the SDK's src/unpac.py. Unknown IDs are retained so newer
+/// resource types can still be inspected without losing their on-disk value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PacFileType {
+    Fda = 0,
+    OspiDa = 1,
+    Dloader = 2,
+    Spl = 3,
+    Sfs = 4,
+    Gpt = 5,
+    Img = 6,
+    Pac = 7,
+    PackFbl = 8,
+    PackSbl = 9,
+    PackTbl = 10,
+    PackNfs = 11,
+    PackRfd = 12,
+    Unknown(u32),
+}
+
+impl From<u32> for PacFileType {
+    fn from(value: u32) -> Self {
+        match value {
+            0 => Self::Fda,
+            1 => Self::OspiDa,
+            2 => Self::Dloader,
+            3 => Self::Spl,
+            4 => Self::Sfs,
+            5 => Self::Gpt,
+            6 => Self::Img,
+            7 => Self::Pac,
+            8 => Self::PackFbl,
+            9 => Self::PackSbl,
+            10 => Self::PackTbl,
+            11 => Self::PackNfs,
+            12 => Self::PackRfd,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl PacFileType {
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::Fda => 0,
+            Self::OspiDa => 1,
+            Self::Dloader => 2,
+            Self::Spl => 3,
+            Self::Sfs => 4,
+            Self::Gpt => 5,
+            Self::Img => 6,
+            Self::Pac => 7,
+            Self::PackFbl => 8,
+            Self::PackSbl => 9,
+            Self::PackTbl => 10,
+            Self::PackNfs => 11,
+            Self::PackRfd => 12,
+            Self::Unknown(value) => value,
+        }
+    }
+
+    pub const fn name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Fda => "FDA",
+            Self::OspiDa => "OSPI_DA",
+            Self::Dloader => "DLOADER",
+            Self::Spl => "SPL",
+            Self::Sfs => "SFS",
+            Self::Gpt => "GPT",
+            Self::Img => "IMG",
+            Self::Pac => "PAC",
+            Self::PackFbl => "PACK_FBL",
+            Self::PackSbl => "PACK_SBL",
+            Self::PackTbl => "PACK_TBL",
+            Self::PackNfs => "PACK_NFS",
+            Self::PackRfd => "PACK_RFD",
+            Self::Unknown(_) => return None,
+        })
+    }
+}
+
+impl From<PacFileType> for u32 {
+    fn from(value: PacFileType) -> Self {
+        value.raw()
+    }
+}
+
+impl std::fmt::Display for PacFileType {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "{} ({})",
+            self.name().unwrap_or("UNKNOWN"),
+            self.raw()
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub partition: String,
-    pub kind: u32,
+    pub kind: PacFileType,
     pub size: u64,
     pub offset: u64,
     pub slot_ab: bool,
     pub components: Vec<String>,
+}
+
+/// Compatibility helper for callers that have an undecoded raw type ID.
+pub fn file_type_name(kind: u32) -> Option<&'static str> {
+    PacFileType::from(kind).name()
 }
 #[derive(Debug)]
 pub struct Pac {
@@ -160,7 +264,7 @@ impl Pac {
             valid_name(&name)?;
             let size = u64le(raw, 72);
             let relative = u64le(raw, 80);
-            let kind = u32le(raw, 88);
+            let kind = PacFileType::from(u32le(raw, 88));
             let slot_ab = name.ends_with("_a");
 
             if slot_ab {
@@ -179,7 +283,7 @@ impl Pac {
             );
             let offset = base.checked_add(relative).context("PAC offset overflow")?;
 
-            if kind == 7 || (depth == 0 && version == 1) {
+            if kind == PacFileType::Pac || (depth == 0 && version == 1) {
                 // Original version-1 containers may contain empty placeholders.
                 if size < TABLE_END {
                     continue;
@@ -286,6 +390,57 @@ impl Pac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_type_enum_round_trips_sdk_values_and_unknown_ids() {
+        let known = [
+            PacFileType::Fda,
+            PacFileType::OspiDa,
+            PacFileType::Dloader,
+            PacFileType::Spl,
+            PacFileType::Sfs,
+            PacFileType::Gpt,
+            PacFileType::Img,
+            PacFileType::Pac,
+            PacFileType::PackFbl,
+            PacFileType::PackSbl,
+            PacFileType::PackTbl,
+            PacFileType::PackNfs,
+            PacFileType::PackRfd,
+        ];
+        for (raw, kind) in known.into_iter().enumerate() {
+            assert_eq!(PacFileType::from(raw as u32), kind);
+            assert_eq!(kind.raw(), raw as u32);
+            assert_eq!(u32::from(kind), raw as u32);
+            assert!(kind.name().is_some());
+        }
+        for raw in [13, 99, u32::MAX] {
+            let kind = PacFileType::from(raw);
+            assert_eq!(kind, PacFileType::Unknown(raw));
+            assert_eq!(kind.raw(), raw);
+            assert_eq!(kind.name(), None);
+            assert_eq!(kind.to_string(), format!("UNKNOWN ({raw})"));
+        }
+    }
+
+    #[test]
+    fn both_pac_readers_preserve_unknown_resource_types() {
+        let bytes = fixture("future", b"payload", 99);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("future.pac");
+        fs::write(&path, &bytes).unwrap();
+        let pac = Pac::open(path, true).unwrap();
+        assert_eq!(pac.entries[0].kind, PacFileType::Unknown(99));
+        let mut stream =
+            crate::stream::PacStream::with_resource_metadata(bytes.as_slice(), true).unwrap();
+        assert_eq!(
+            stream.next_entry().unwrap().unwrap().kind,
+            PacFileType::Unknown(99)
+        );
+        stream.finish().unwrap();
+        assert_eq!(stream.resources[0].kind, PacFileType::Unknown(99));
+    }
+
     fn fixture(name: &str, data: &[u8], kind: u32) -> Vec<u8> {
         let mut bytes = vec![0; TABLE_END as usize];
         bytes[..4].copy_from_slice(&MAGIC.to_le_bytes());

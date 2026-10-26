@@ -6,7 +6,10 @@ use sdeasyboot::{
     fastboot::DeviceFailure,
     usb::{self, EasybootClient, Mode, UsbLink},
 };
-use sdimage::{pac::Entry, stream::PacStream};
+use sdimage::{
+    pac::{Entry, PacFileType},
+    stream::PacStream,
+};
 use std::{
     collections::{BTreeSet, VecDeque},
     fs::File,
@@ -193,11 +196,11 @@ fn flash_with_progress<T: usb::BulkTransport>(
 
 fn loader(entry: &Entry) -> Option<(u8, &'static str)> {
     match (entry.kind, entry.partition.contains("ssb")) {
-        (0, false) => Some((0, "FDA")),
-        (1, false) => Some((1, "ospi1$da")),
-        (2, false) => Some((2, "emmc1$da")),
-        (0, true) => Some((3, "ssb_fda")),
-        (2, true) => Some((4, "ssb_emmc1$da")),
+        (PacFileType::Fda, false) => Some((0, "FDA")),
+        (PacFileType::OspiDa, false) => Some((1, "ospi1$da")),
+        (PacFileType::Dloader, false) => Some((2, "emmc1$da")),
+        (PacFileType::Fda, true) => Some((3, "ssb_fda")),
+        (PacFileType::Dloader, true) => Some((4, "ssb_emmc1$da")),
         _ => None,
     }
 }
@@ -234,7 +237,7 @@ fn cache_fda(
         storage: String::new(),
         entry: Entry {
             partition: "FDA".into(),
-            kind: 0,
+            kind: PacFileType::Fda,
             size,
             offset: 0,
             slot_ab: false,
@@ -344,7 +347,7 @@ impl<T: Target> Engine<'_, T> {
         !overridden_fda(self.options, entry)
             && (loader(entry).is_some()
                 || (self.actions.is_empty()
-                    && entry.kind != 1
+                    && entry.kind != PacFileType::OspiDa
                     && !plan::is_boot(&plan::storage_partition(storage, &entry.partition))))
     }
 
@@ -857,7 +860,7 @@ mod tests {
     fn entry(name: &str, kind: u32, size: u64) -> Entry {
         Entry {
             partition: name.into(),
-            kind,
+            kind: kind.into(),
             size,
             offset: 0,
             slot_ab: false,

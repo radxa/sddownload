@@ -1,6 +1,6 @@
 use crate::{cli::Cli, config::Config};
 use anyhow::{ensure, Context, Result};
-use sdimage::pac::Pac;
+use sdimage::pac::{Pac, PacFileType};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -95,7 +95,7 @@ impl Plan {
                 };
 
                 match entry.kind {
-                    0 => {
+                    PacFileType::Fda => {
                         if entry.partition.contains("ssb") {
                             ssb_fda = Some(Flash {
                                 partition: "ssb_fda".into(),
@@ -105,7 +105,7 @@ impl Plan {
                             plan.fda = Some(path)
                         }
                     }
-                    1 => {
+                    PacFileType::OspiDa => {
                         if !entry.partition.contains("ssb") {
                             ospi_da = Some(Flash {
                                 partition: "ospi1$da".into(),
@@ -113,7 +113,7 @@ impl Plan {
                             })
                         }
                     }
-                    2 => {
+                    PacFileType::Dloader => {
                         if entry.partition.contains("ssb") {
                             ssb_da = Some(Flash {
                                 partition: "ssb_emmc1$da".into(),
@@ -126,7 +126,7 @@ impl Plan {
                             })
                         }
                     }
-                    7 => {}
+                    PacFileType::Pac => {}
                     _ => {
                         if options.b_part && entry.slot_ab {
                             plan.images.push(Flash {

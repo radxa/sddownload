@@ -202,16 +202,16 @@ fn list_partitions_from_pac_is_offline_and_lists_original_resources() {
         .skip(2)
         .map(|line| line.split_whitespace().collect())
         .collect();
-    for (name, size, kind) in [
-        ("emmc1$nested$kernel_a", "5", "6"),
-        ("emmc1$nested$misc", "0", "6"),
-        ("emmc1$nested$empty_a", "0", "6"),
-        ("emmc1$nested$emptyFDA", "0", "0"),
-        ("emmc1$nested$FDA", "15", "0"),
-        ("emmc1$$da", "5", "2"),
+    for (name, size, kind, id) in [
+        ("emmc1$nested$kernel_a", "5", "IMG", "(6)"),
+        ("emmc1$nested$misc", "0", "IMG", "(6)"),
+        ("emmc1$nested$empty_a", "0", "IMG", "(6)"),
+        ("emmc1$nested$emptyFDA", "0", "FDA", "(0)"),
+        ("emmc1$nested$FDA", "15", "FDA", "(0)"),
+        ("emmc1$$da", "5", "DLOADER", "(2)"),
     ] {
         assert!(
-            rows.iter().any(|row| row[..3] == [name, size, kind]),
+            rows.iter().any(|row| row[..4] == [name, size, kind, id]),
             "missing {name}: {output}"
         );
     }
@@ -231,6 +231,56 @@ fn list_partitions_from_pac_is_offline_and_lists_original_resources() {
     }
     assert!(error.contains("not device partition capacity"), "{error}");
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn list_partitions_shows_sdk_file_type_names_and_unknown_numeric_ids() {
+    let types = [
+        "FDA", "OSPI_DA", "DLOADER", "SPL", "SFS", "GPT", "IMG", "PAC", "PACK_FBL", "PACK_SBL",
+        "PACK_TBL", "PACK_NFS", "PACK_RFD",
+    ];
+    let child = packet(0, &[], true);
+    let names: Vec<_> = (0..types.len())
+        .map(|kind| format!("resource_{kind}"))
+        .collect();
+    let mut entries: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(kind, name)| {
+            (
+                name.as_str(),
+                kind as u32,
+                if kind == 7 {
+                    child.as_slice()
+                } else {
+                    b"x".as_slice()
+                },
+            )
+        })
+        .collect();
+    entries.push(("future_resource", 99, b"x"));
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--emmc1", "-"])
+        .write_stdin(packet(0, &entries, true))
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    let output = String::from_utf8_lossy(&result.get_output().stdout);
+    for (kind, expected) in types.iter().enumerate() {
+        let name = format!("emmc1$$resource_{kind}");
+        let row = output
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(name.as_str()))
+            .unwrap();
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields[2], *expected, "{row}");
+        assert_eq!(fields[3], format!("({kind})"), "{row}");
+    }
+    let row = output
+        .lines()
+        .find(|line| line.starts_with("emmc1$$future_resource "))
+        .unwrap();
+    assert!(row.contains("UNKNOWN (99)"), "{row}");
 }
 
 #[test]

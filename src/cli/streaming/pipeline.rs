@@ -285,7 +285,7 @@ fn produce(
             }
             if loader(&entry).is_none()
                 && (!actions.is_empty()
-                    || entry.kind == 1
+                    || entry.kind == PacFileType::OspiDa
                     || plan::is_boot(&plan::storage_partition(storage, &entry.partition)))
             {
                 continue;
