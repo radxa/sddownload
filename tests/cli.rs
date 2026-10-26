@@ -57,6 +57,7 @@ fn supported_options_are_visible_and_removed_options_are_rejected() {
     let help = String::from_utf8_lossy(&output.get_output().stdout);
 
     for flag in [
+        "--list-partitions",
         "--fda",
         "--ospi1",
         "--ospi2",
@@ -133,6 +134,251 @@ fn repeated_scalar_options_override_and_actions_append() {
     assert_eq!(options.sn, "second");
     assert_eq!(options.flash, ["one", "one.bin", "two", "two.bin"]);
     assert_eq!(options.read, ["three", "three.bin", "four", "-"]);
+}
+
+#[test]
+fn list_partitions_is_standalone_and_conflicts_with_device_operations() {
+    assert!(
+        Cli::try_parse_from(["sddownload", "--list-partitions"])
+            .unwrap()
+            .list_partitions
+    );
+    assert!(Cli::try_parse_from(["sddownload", "--list-partitions", "--fda", "fda.bin"]).is_ok());
+    for operation in [
+        vec!["--flash", "boot", "image.bin"],
+        vec!["--read", "boot", "-"],
+        vec!["--erase", "boot"],
+        vec!["--reboot"],
+        vec!["--unpac-path", "out"],
+    ] {
+        let mut args = vec!["sddownload", "--list-partitions"];
+        args.extend(operation);
+        let error = Cli::try_parse_from(args).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}
+
+#[test]
+fn list_partitions_from_pac_is_offline_and_lists_original_resources() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("firmware.pac");
+    let nested = packet(
+        0,
+        &[
+            ("kernel_a", 6, b"image"),
+            ("FDA", 0, b"\x7fELFunsupported"),
+            ("misc", 6, b""),
+            ("empty_a", 6, b""),
+            ("emptyFDA", 0, b""),
+        ],
+        true,
+    );
+    fs::write(
+        &source,
+        packet(0, &[("nested", 7, &nested), ("da", 2, b"agent")], true),
+    )
+    .unwrap();
+    let result = cargo_bin_cmd!("sddownload")
+        .args([
+            "--list-partitions",
+            "--auto",
+            "--fda",
+            "missing-fda.bin",
+            "--emmc1",
+        ])
+        .arg(&source)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    let output = String::from_utf8_lossy(&result.get_output().stdout);
+    assert!(
+        output.starts_with(&format!("PAC: {} (input --emmc1)\n", source.display())),
+        "{output}"
+    );
+    assert_eq!(output.matches(source.to_str().unwrap()).count(), 1);
+    assert!(!output.split_whitespace().any(|field| field == "SOURCE") && !output.contains('\t'));
+    let rows: Vec<Vec<_>> = output
+        .lines()
+        .skip(2)
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    for (name, size, kind) in [
+        ("emmc1$nested$kernel_a", "5", "6"),
+        ("emmc1$nested$misc", "0", "6"),
+        ("emmc1$nested$empty_a", "0", "6"),
+        ("emmc1$nested$emptyFDA", "0", "0"),
+        ("emmc1$nested$FDA", "15", "0"),
+        ("emmc1$$da", "5", "2"),
+    ] {
+        assert!(
+            rows.iter().any(|row| row[..3] == [name, size, kind]),
+            "missing {name}: {output}"
+        );
+    }
+    assert!(!output.contains("kernel_b") && !output.contains("empty_b"));
+    assert!(output.contains("FDA (bootstrap; not a partition)"));
+    assert!(output.contains("download agent (bootstrap; not a partition)"));
+    assert!(output.contains("PAC container"));
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    for forbidden in [
+        "ADB auto-reboot",
+        "ROM FDA:",
+        "Caching",
+        "Flash ",
+        "Download successfully",
+    ] {
+        assert!(!error.contains(forbidden), "{error}");
+    }
+    assert!(error.contains("not device partition capacity"), "{error}");
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn list_partitions_from_stdin_handles_metadata_and_explicit_crc_verification() {
+    let nested = packet(
+        0,
+        &[
+            ("kernel_a", 6, b"image"),
+            ("actual_b", 6, b"b"),
+            ("FDA", 0, b"ROM"),
+        ],
+        true,
+    );
+    let mut bytes = packet(
+        1,
+        &[("emmc1", 7, &nested), ("ospi1", 7, b""), ("sd3", 6, b"")],
+        true,
+    );
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--pac", "-"])
+        .write_stdin(bytes.clone())
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    let output = String::from_utf8_lossy(&result.get_output().stdout);
+    let rows: Vec<Vec<_>> = output
+        .lines()
+        .skip(2)
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    for name in [
+        "emmc1",
+        "ospi1",
+        "sd3",
+        "emmc1$$kernel_a",
+        "emmc1$$actual_b",
+        "emmc1$$FDA",
+    ] {
+        assert!(
+            rows.iter().any(|row| row[0] == name),
+            "missing {name}: {output}"
+        );
+    }
+    assert!(!output.contains("kernel_b") && !output.contains("actual_a"));
+    *bytes.last_mut().unwrap() ^= 1;
+    cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--pac", "-"])
+        .write_stdin(bytes.clone())
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--pac", "-", "--verify-first"])
+        .write_stdin(bytes.clone())
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    assert!(result.get_output().stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.get_output().stderr).contains("CRC mismatch"));
+    cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--pac", "-", "--skip-verify"])
+        .write_stdin(bytes)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+}
+
+#[test]
+fn file_listing_is_metadata_only_unless_full_verification_is_requested() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("corrupt-image.pac");
+    let mut bytes = packet(0, &[("kernel_a", 6, b"image")], true);
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&path, bytes).unwrap();
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--emmc1"])
+        .arg(&path)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    assert!(String::from_utf8_lossy(&result.get_output().stdout).contains("emmc1$$kernel_a"));
+    assert!(String::from_utf8_lossy(&result.get_output().stderr)
+        .contains("metadata only; CRCs not checked"));
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--verify-first", "--emmc1"])
+        .arg(&path)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    assert!(result.get_output().stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.get_output().stderr).contains("CRC mismatch"));
+}
+
+#[test]
+fn list_partitions_groups_multiple_pacs_without_repeating_source_per_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.pac");
+    let second = directory.path().join("second.pac");
+    fs::write(
+        &first,
+        packet(0, &[("FDA", 0, b"ROM"), ("spl", 6, b"spl")], true),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        packet(0, &[("kernel_a", 6, b"a"), ("kernel_b", 6, b"b")], true),
+    )
+    .unwrap();
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--ospi1"])
+        .arg(&first)
+        .arg("--emmc1")
+        .arg(&second)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .success();
+    let output = String::from_utf8_lossy(&result.get_output().stdout);
+    for path in [&first, &second] {
+        assert_eq!(
+            output.matches(path.to_str().unwrap()).count(),
+            1,
+            "{output}"
+        );
+    }
+    assert_eq!(output.matches("RESOURCE").count(), 2);
+    for name in [
+        "ospi1$$FDA",
+        "ospi1$$spl",
+        "emmc1$$kernel_a",
+        "emmc1$$kernel_b",
+    ] {
+        assert!(output.contains(name), "{output}");
+    }
+    assert!(
+        !output.split_whitespace().any(|field| field == "SOURCE") && !output.contains("inferred")
+    );
+}
+
+#[test]
+fn list_partitions_rejects_wrong_pac_kind_without_device_access() {
+    let result = cargo_bin_cmd!("sddownload")
+        .args(["--list-partitions", "--pac", "-"])
+        .write_stdin(packet(0, &[("kernel", 6, b"image")], true))
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    assert!(result.get_output().stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.get_output().stderr).contains("expects version 1"));
 }
 
 #[test]

@@ -70,6 +70,7 @@ Additional options:
 --fda PATH              Raw ROM FDA image; - reads stdin; overrides PAC FDA
 --config APP_JSON       Explicit application configuration file
 --adb-key PRIVATE_KEY   Explicit ADB RSA private-key file
+--list-partitions       Inspect PAC resources or query fastboot; do not flash
 --version
 ```
 
@@ -161,6 +162,73 @@ and final device response are verified. Status and progress messages go to
 stderr when reading to stdout, keeping redirected output binary-clean. A failed
 verification publishes no readback bytes; an output write failure returns an
 error. File readbacks continue to use atomic replacement after verification.
+
+## Listing partitions
+
+List names usable as `PARTITION` in `--read PARTITION PATH` and
+`--flash PARTITION PATH`:
+
+```sh
+sddownload --list-partitions
+sddownload --list-partitions --fda fda.bin
+sddownload --list-partitions --emmc1 firmware.pac
+zstd -dc firmware.pac.zst | sddownload --list-partitions --emmc1 -
+```
+
+When a PAC input is specified, listing is entirely offline: it does not access
+USB, send FDA/download agents, extract images, or flash. This takes precedence
+over `--fda` and `--auto`. All storage input flags and version-1 `--pac` inputs
+are supported, including nested PACs and stdin. Listing is metadata-only by
+default: regular files seek directly between PAC headers and entry tables,
+without reading image payloads or calculating their CRCs. This does not extract
+or decompress images.
+
+Use `--verify-first` with `--list-partitions` to explicitly validate available
+PAC CRCs before printing the table. That scans all payload bytes and can take a
+long time for multi-gigabyte or nested archives. `--skip-verify` is accepted but
+is unnecessary for the default metadata-only listing. This listing policy does
+not change normal flashing's default CRC verification.
+
+Stdin is not seekable, so stdin listings must still read past payloads to reach
+later or nested metadata, even without CRC verification. For a fast listing of
+a local PAC, pass its path directly rather than piping it through stdin.
+
+PAC output uses aligned, space-padded columns: `RESOURCE`, `IMAGE_BYTES`, `KIND`,
+and `NOTES`. The source path and input option appear once above each PAC's table;
+multiple PAC inputs get separate tables, so there is no repeated `SOURCE`
+column. `IMAGE_BYTES` is the encoded payload length, not device partition
+capacity, and `KIND` is the numeric type stored in the PAC table.
+
+All resources recorded in the PAC are included: images such as SPL, FDA and
+download agents, nested PAC containers, empty entries, and repeated resources.
+Resource names retain the PAC's original slot suffixes and parent names, with
+the appropriate storage prefix. Only names present in the PAC are listed:
+`kernel_a` does not produce a `kernel_b` row unless a B entry is actually present.
+Normal flashing still uses its existing slot selection and `--b-part` behavior.
+
+FDA/download agents and container records are labeled separately because they
+are not ordinary partitions for `--read` or `--flash`. Empty entries have no
+payload and do not establish device capacity or existence. PAC results describe
+the archive, not the currently installed partition map. Device listings also
+use aligned columns and retain their device-advertised partition names.
+
+Without a PAC, listing detects ROM or fastboot mode. If the device is in ROM /
+download-loader mode, provide `--fda` to transfer the raw FDA and wait for
+fastboot. No storage images are flashed. Devices already in fastboot can be
+queried without an FDA. An explicit `--auto` retains the usual ADB bootloader
+reboot behavior when accessing a device.
+
+The device query is read-only `getvar:all`. It recognizes device-advertised
+`partition-size:NAME`, `partition-type:NAME`, and `is-logical:NAME` fields,
+preserving names exactly. `SIZE_BYTES` is the reported hexadecimal size converted
+to decimal bytes; `-` means unavailable. Partial advertisements followed by a
+fastboot FAIL are reported with a warning; transport errors remain errors.
+
+Partition enumeration is optional in fastboot and has not been confirmed on
+every SemiDrive firmware. If no names are advertised, the command exits with an
+explanation instead of guessing partition names. Use PAC inspection as the
+offline alternative. Listing cannot be combined with `--flash`, `--read`,
+`--erase`, `--reboot`, or `--unpac-path`.
 
 ## Streaming PAC downloads
 

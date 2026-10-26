@@ -6,6 +6,7 @@ use fastboot_protocol::protocol::{FastBootCommand, FastBootResponse};
 use md5::{Digest, Md5};
 use sdimage::sparse::StreamImage;
 use std::{
+    collections::BTreeMap,
     io::{Read, Seek, Write},
     path::Path,
 };
@@ -25,6 +26,74 @@ pub struct FlashProgress {
     pub completed: u64,
     pub total: u64,
     pub transferred: u64,
+}
+
+/// Names are preserved exactly as advertised by the device, including storage
+/// prefixes. Missing fields mean that the server did not provide usable data.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartitionInfo {
+    pub name: String,
+    pub size: Option<u64>,
+    pub kind: Option<String>,
+    pub logical: Option<bool>,
+}
+
+#[derive(Debug)]
+pub struct PartitionListing {
+    pub partitions: Vec<PartitionInfo>,
+    pub warning: Option<String>,
+}
+
+fn advertised_partitions(lines: impl IntoIterator<Item = String>) -> Vec<PartitionInfo> {
+    let mut partitions: BTreeMap<String, PartitionInfo> = BTreeMap::new();
+    for line in lines {
+        for (prefix, field) in [
+            ("partition-size:", 0),
+            ("partition-type:", 1),
+            ("is-logical:", 2),
+        ] {
+            let Some(value) = line.trim().strip_prefix(prefix) else {
+                continue;
+            };
+            let Some((name, value)) = value.rsplit_once(':') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if name.is_empty() || !name.is_ascii() || name.chars().any(char::is_control) {
+                continue;
+            }
+            let partition = partitions
+                .entry(name.into())
+                .or_insert_with(|| PartitionInfo {
+                    name: name.into(),
+                    ..PartitionInfo::default()
+                });
+            match field {
+                // Fastboot partition-size values use hexadecimal, with an
+                // optional 0x prefix, rather than PAC payload byte counts.
+                0 => {
+                    partition.size = u64::from_str_radix(
+                        value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .unwrap_or(value),
+                        16,
+                    )
+                    .ok()
+                }
+                1 if !value.is_empty() => partition.kind = Some(value.into()),
+                2 => {
+                    partition.logical = match value {
+                        "yes" => Some(true),
+                        "no" => Some(false),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    partitions.into_values().collect()
 }
 
 #[derive(Debug)]
@@ -129,6 +198,32 @@ impl<T: BulkTransport> FastbootClient<T> {
         } else {
             Ok(value)
         }
+    }
+
+    /// Best-effort enumeration through getvar:all. Partition enumeration is
+    /// optional; individual partition-size queries require names already known.
+    /// Never issues OEM, flash, erase, reboot, or partition readback commands.
+    pub fn list_partitions(&mut self) -> Result<PartitionListing> {
+        let result = self.getvar("all");
+        let mut lines = self.information.clone();
+        let warning = match result {
+            Ok(value) => {
+                lines.extend(value.lines().map(str::to_owned));
+                None
+            }
+            Err(error) if error.downcast_ref::<DeviceFailure>().is_some() => {
+                Some(error.to_string())
+            }
+            Err(error) => return Err(error.context("query partition information with getvar:all")),
+        };
+        let partitions = advertised_partitions(lines);
+        ensure!(!partitions.is_empty(),
+            "fastboot did not advertise any partitions through getvar:all{}; this firmware may not support enumeration; use --list-partitions with a PAC to inspect its image entries",
+            warning.as_ref().map(|error| format!(" ({error})")).unwrap_or_default());
+        Ok(PartitionListing {
+            partitions,
+            warning,
+        })
     }
 
     pub fn download(&mut self, source: &mut impl Read, size: u64, verify: bool) -> Result<()> {
@@ -414,6 +509,81 @@ mod tests {
                 b"md5:900150983cd24fb0d6963f7d28e17f72".to_vec()
             ]
         );
+    }
+
+    #[test]
+    fn list_partitions_merges_info_and_okay_fields_without_changing_names() {
+        let mut client = FastbootClient::new(peer(&[
+            b"INFOproduct:SemiDrive",
+            b"INFOpartition-size:emmc1$$boot_a: 0x1000",
+            b"INFOpartition-type:emmc1$$boot_a:raw",
+            b"INFOis-logical:emmc1$$boot_a:no",
+            b"INFOpartition-type:ospi1$$spl:raw",
+            b"INFOpartition-size:bad-size:not-a-size",
+            b"INFOpartition-size::0x10",
+            b"OKAYpartition-size:ospi1$$spl:00000200",
+        ]));
+        let listing = client.list_partitions().unwrap();
+        assert!(listing.warning.is_none());
+        assert_eq!(
+            listing.partitions,
+            [
+                PartitionInfo {
+                    name: "bad-size".into(),
+                    ..PartitionInfo::default()
+                },
+                PartitionInfo {
+                    name: "emmc1$$boot_a".into(),
+                    size: Some(4096),
+                    kind: Some("raw".into()),
+                    logical: Some(false)
+                },
+                PartitionInfo {
+                    name: "ospi1$$spl".into(),
+                    size: Some(512),
+                    kind: Some("raw".into()),
+                    logical: None
+                },
+            ]
+        );
+        assert_eq!(client.transport.writes, [b"getvar:all".to_vec()]);
+    }
+
+    #[test]
+    fn list_partitions_keeps_partial_device_advertisements_after_fail() {
+        let mut client = FastbootClient::new(peer(&[
+            b"INFOpartition-size:boot:1000",
+            b"FAILnot all variables available",
+        ]));
+        let listing = client.list_partitions().unwrap();
+        assert_eq!(listing.partitions[0].name, "boot");
+        assert_eq!(listing.partitions[0].size, Some(4096));
+        assert!(listing.warning.unwrap().contains("not all variables"));
+        assert_eq!(client.transport.writes, [b"getvar:all".to_vec()]);
+    }
+
+    #[test]
+    fn list_partitions_reports_unsupported_or_empty_enumeration() {
+        for responses in [
+            vec![b"FAILunknown variable".as_slice()],
+            vec![b"OKAY".as_slice()],
+            vec![b"INFOproduct:SemiDrive".as_slice(), b"OKAY"],
+        ] {
+            let mut client = FastbootClient::new(peer(&responses));
+            let error = client.list_partitions().unwrap_err();
+            assert!(
+                error.to_string().contains("may not support enumeration"),
+                "{error:#}"
+            );
+            assert_eq!(client.transport.writes, [b"getvar:all".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn list_partitions_does_not_mask_transport_errors_as_partial_success() {
+        let mut client = FastbootClient::new(peer(&[b"INFOpartition-size:boot:0x1000"]));
+        let error = client.list_partitions().unwrap_err();
+        assert!(format!("{error:#}").contains("no queued response"));
     }
 
     #[test]

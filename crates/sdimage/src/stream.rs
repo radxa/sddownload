@@ -1,15 +1,26 @@
-//! Forward-only PAC traversal. Payloads are read once; checksums are checked
-//! when their containing PAC ends, including bytes skipped between entries.
+//! Forward-only PAC traversal and seekable metadata inspection. Payloads are
+//! read for checksum verification; unchecked seekable inspection skips them.
 use crate::{pac::Entry, BZIP2};
 use anyhow::{ensure, Context, Result};
 use std::{
     collections::VecDeque,
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom},
 };
 
 struct Item {
     entry: Entry,
     container: bool,
+    resource_components: Vec<String>,
+}
+
+/// An entry exactly as named in a PAC table, before download-time slot-name
+/// normalization. Container entries and empty/bootstrap resources are retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resource {
+    pub name: String,
+    pub size: u64,
+    pub kind: u32,
+    pub container: bool,
 }
 
 struct Frame {
@@ -22,13 +33,33 @@ struct Frame {
 
 pub struct PacStream<R> {
     reader: R,
+    seek: Option<SeekReader<R>>,
     position: u64,
     remaining: u64,
     frames: Vec<Frame>,
     verify: bool,
+    collect_resources: bool,
     pub version: u32,
     pub product: String,
     pub empty: Vec<String>,
+    /// Metadata for zero-payload entries, retaining type and A/B names for
+    /// inspection. `empty` remains the list used by existing erase scheduling.
+    pub empty_entries: Vec<Entry>,
+    /// Populated by the metadata constructors; consume/finish before using it
+    /// as a complete catalog. CRCs are checked only when verification is enabled.
+    pub resources: Vec<Resource>,
+}
+
+type SeekReader<R> = fn(&mut R, SeekFrom) -> io::Result<u64>;
+
+impl<R: Read + Seek> PacStream<R> {
+    /// Seek between PAC headers/tables without reading image payloads when
+    /// `verify` is false. Verification deliberately reads all protected bytes.
+    pub fn with_seekable_resource_metadata(mut reader: R, verify: bool) -> Result<Self> {
+        let end = reader.seek(SeekFrom::End(0))?;
+        reader.rewind()?;
+        Self::new_inner(reader, verify, true, Some(R::seek), Some(end))
+    }
 }
 
 fn word(bytes: &[u8], at: usize) -> u32 {
@@ -53,17 +84,37 @@ fn text(bytes: &[u8]) -> Result<String> {
 
 impl<R: Read> PacStream<R> {
     pub fn new(reader: R, verify: bool) -> Result<Self> {
+        Self::new_inner(reader, verify, false, None, None)
+    }
+
+    /// Inspect every resource without changing the normalized entries used by
+    /// the downloader. Normal streaming does not retain a full resource catalog.
+    pub fn with_resource_metadata(reader: R, verify: bool) -> Result<Self> {
+        Self::new_inner(reader, verify, true, None, None)
+    }
+
+    fn new_inner(
+        reader: R,
+        verify: bool,
+        collect_resources: bool,
+        seek: Option<SeekReader<R>>,
+        end: Option<u64>,
+    ) -> Result<Self> {
         let mut stream = Self {
             reader,
+            seek,
             position: 0,
             remaining: 0,
             frames: vec![],
             verify,
+            collect_resources,
             version: 0,
             product: String::new(),
             empty: vec![],
+            empty_entries: vec![],
+            resources: vec![],
         };
-        stream.container(None, vec![])?;
+        stream.container(end, vec![], vec![])?;
         Ok(stream)
     }
 
@@ -100,6 +151,16 @@ impl<R: Read> PacStream<R> {
             end >= self.position,
             "PAC requires a backward read or contains overlapping entries"
         );
+        if !self.verify {
+            if let Some(seek) = self.seek {
+                ensure!(
+                    seek(&mut self.reader, SeekFrom::Start(end))? == end,
+                    "PAC seek did not reach the requested offset"
+                );
+                self.position = end;
+                return Ok(());
+            }
+        }
         let mut buffer = [0; 65536];
         while self.position < end {
             let count = (end - self.position).min(buffer.len() as u64) as usize;
@@ -108,7 +169,12 @@ impl<R: Read> PacStream<R> {
         Ok(())
     }
 
-    fn container(&mut self, end: Option<u64>, parents: Vec<String>) -> Result<()> {
+    fn container(
+        &mut self,
+        end: Option<u64>,
+        parents: Vec<String>,
+        resource_parents: Vec<String>,
+    ) -> Result<()> {
         use crate::pac::{MAGIC, TABLE_END};
         ensure!(parents.len() < 32, "PAC nesting exceeds limit");
         let base = self.position;
@@ -147,14 +213,39 @@ impl<R: Read> PacStream<R> {
         for row in table.chunks_exact(128) {
             let mut name = text(&row[..72])?;
             super::pac::valid_name(&name)?;
+            let size = long(row, 72);
+            let kind = word(row, 88);
+            let container = kind == 7 || (parents.is_empty() && version == 1);
+            let resource_components = if self.collect_resources {
+                self.resources.push(Resource {
+                    name: super::pac::name_for(&resource_parents, &name, self.version == 1),
+                    size,
+                    kind,
+                    container,
+                });
+                let mut components = resource_parents.clone();
+                components.push(name.clone());
+                components
+            } else {
+                vec![]
+            };
             let slot_ab = name.ends_with("_a");
             if slot_ab {
                 name.truncate(name.len() - 2);
                 super::pac::valid_name(&name)?;
             }
             let partition = super::pac::name_for(&parents, &name, self.version == 1);
-            let size = long(row, 72);
             if size == 0 {
+                let mut components = parents.clone();
+                components.push(format!("{name}.bin"));
+                self.empty_entries.push(Entry {
+                    partition: partition.clone(),
+                    kind,
+                    size,
+                    offset: 0,
+                    slot_ab,
+                    components,
+                });
                 self.empty.push(partition);
                 continue;
             }
@@ -165,8 +256,6 @@ impl<R: Read> PacStream<R> {
                 relative >= TABLE_END && end.is_none_or(|end| entry_end <= end),
                 "partition {partition} exceeds PAC bounds"
             );
-            let kind = word(row, 88);
-            let container = kind == 7 || (parents.is_empty() && version == 1);
             if container && size < TABLE_END && self.version == 1 {
                 continue;
             }
@@ -186,6 +275,7 @@ impl<R: Read> PacStream<R> {
                     components,
                 },
                 container,
+                resource_components,
             });
         }
         items.sort_by_key(|item| item.entry.offset);
@@ -216,7 +306,16 @@ impl<R: Read> PacStream<R> {
     }
 
     pub fn next_entry(&mut self) -> Result<Option<Entry>> {
-        io::copy(self, &mut io::sink())?;
+        if !self.verify && self.seek.is_some() {
+            let end = self
+                .position
+                .checked_add(self.remaining)
+                .context("PAC payload offset overflow")?;
+            self.advance(end)?;
+            self.remaining = 0;
+        } else {
+            io::copy(self, &mut io::sink())?;
+        }
         loop {
             let Some(frame) = self.frames.last_mut() else {
                 return Ok(None);
@@ -227,6 +326,7 @@ impl<R: Read> PacStream<R> {
                     self.container(
                         Some(item.entry.offset + item.entry.size),
                         item.entry.components,
+                        item.resource_components,
                     )?;
                     continue;
                 }
@@ -360,6 +460,139 @@ pub(crate) mod tests {
         assert_eq!(payload, b"payload");
         assert!(pac.next_entry().unwrap().is_none());
         assert_eq!(pac.empty, ["emmc1$$misc"]);
+    }
+
+    #[test]
+    fn resource_catalog_preserves_original_names_loaders_duplicates_and_containers() {
+        let child = packet(
+            0,
+            &[
+                ("kernel_a", 6, b"a"),
+                ("FDA", 0, b"ROM"),
+                ("empty_a", 6, b""),
+                ("kernel_a", 6, b"duplicate"),
+            ],
+        );
+        let bytes = packet(0, &[("nested_a", 7, &child), ("spl", 6, b"spl")]);
+        let mut pac = PacStream::with_resource_metadata(bytes.as_slice(), true).unwrap();
+        let entry = pac.next_entry().unwrap().unwrap();
+        assert_eq!(entry.partition, "nested$kernel");
+        assert!(entry.slot_ab);
+        pac.finish().unwrap();
+        let names: Vec<_> = pac
+            .resources
+            .iter()
+            .map(|resource| resource.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "nested_a",
+                "spl",
+                "nested_a$kernel_a",
+                "nested_a$FDA",
+                "nested_a$empty_a",
+                "nested_a$kernel_a"
+            ]
+        );
+        assert!(pac.resources[0].container);
+        assert_eq!(pac.resources[3].kind, 0);
+        assert_eq!(pac.resources[4].size, 0);
+
+        let mut normal = PacStream::new(bytes.as_slice(), true).unwrap();
+        normal.finish().unwrap();
+        assert!(normal.resources.is_empty());
+    }
+
+    #[test]
+    fn seekable_catalog_skips_eight_gib_of_payload_to_reach_nested_metadata() {
+        struct MetadataOnly {
+            regions: Vec<(u64, Vec<u8>)>,
+            position: u64,
+            end: u64,
+            read_bytes: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for MetadataOnly {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.position == self.end {
+                    return Ok(0);
+                }
+                let Some((start, bytes)) = self.regions.iter().find(|(start, bytes)| {
+                    self.position >= *start && self.position - *start < bytes.len() as u64
+                }) else {
+                    return Err(io::Error::other("attempted to read an image payload"));
+                };
+                let offset = (self.position - start) as usize;
+                let count = buffer.len().min(bytes.len() - offset);
+                buffer[..count].copy_from_slice(&bytes[offset..offset + count]);
+                self.position += count as u64;
+                self.read_bytes.set(self.read_bytes.get() + count);
+                Ok(count)
+            }
+        }
+        impl Seek for MetadataOnly {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                let position = match from {
+                    SeekFrom::Start(offset) => i128::from(offset),
+                    SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+                    SeekFrom::End(offset) => i128::from(self.end) + i128::from(offset),
+                };
+                if position < 0 || position > i128::from(self.end) {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
+                self.position = position as u64;
+                Ok(self.position)
+            }
+        }
+        let child = packet(0, &[("FDA", 0, b"ROM"), ("empty_a", 6, b"")]);
+        let mut root = packet(0, &[("huge", 6, b"x"), ("nested_a", 7, &child)]);
+        let huge_size = 8_u64 * 1024 * 1024 * 1024;
+        let child_start = TABLE_END + huge_size;
+        root[1096..1104].copy_from_slice(&huge_size.to_le_bytes());
+        root[1232..1240].copy_from_slice(&child_start.to_le_bytes());
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = MetadataOnly {
+            regions: vec![
+                (0, root[..TABLE_END as usize].to_vec()),
+                (child_start, child[..TABLE_END as usize].to_vec()),
+            ],
+            position: 0,
+            end: child_start + child.len() as u64,
+            read_bytes: reads.clone(),
+        };
+        let mut pac = PacStream::with_seekable_resource_metadata(reader, false).unwrap();
+        pac.finish().unwrap();
+        assert!(reads.get() < 4096, "read {} bytes", reads.get());
+        let names: Vec<_> = pac
+            .resources
+            .iter()
+            .map(|resource| resource.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["huge", "nested_a", "nested_a$FDA", "nested_a$empty_a"]
+        );
+        assert_eq!(pac.resources[0].size, huge_size);
+    }
+
+    #[test]
+    fn seekable_metadata_still_checks_bounds_and_optional_payload_crcs() {
+        let mut bytes = packet(0, &[("kernel_a", 6, b"image")]);
+        *bytes.last_mut().unwrap() ^= 1;
+        let mut metadata =
+            PacStream::with_seekable_resource_metadata(io::Cursor::new(&bytes), false).unwrap();
+        metadata.finish().unwrap();
+        let mut verified =
+            PacStream::with_seekable_resource_metadata(io::Cursor::new(&bytes), true).unwrap();
+        assert!(verified
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("CRC mismatch"));
+        bytes.pop();
+        assert!(
+            PacStream::with_seekable_resource_metadata(io::Cursor::new(&bytes), false).is_err()
+        );
     }
 
     #[test]

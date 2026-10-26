@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+mod listing_table;
+mod partitions;
 mod progress;
 mod streaming;
 
@@ -23,6 +25,9 @@ mod streaming;
     about = "SemiDrive downloader"
 )]
 pub struct Cli {
+    /// List PAC metadata or query fastboot partitions; --verify-first checks CRCs.
+    #[arg(long, conflicts_with_all = ["flash", "read", "erase", "reboot", "unpac_path"])]
+    pub list_partitions: bool,
     /// Raw ROM FDA image, overriding PAC FDA images; use - for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "unpac_path")]
     pub fda: Option<PathBuf>,
@@ -224,6 +229,9 @@ fn with_fastboot<R>(
 }
 
 pub fn execute(options: &Cli) -> Result<()> {
+    if options.list_partitions {
+        return partitions::run(options);
+    }
     let actions = options.actions()?;
     let settings = Config::load(options.config.as_deref())?;
 

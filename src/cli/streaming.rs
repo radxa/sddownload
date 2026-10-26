@@ -523,7 +523,7 @@ impl<T: Target> Engine<'_, T> {
     }
 }
 
-fn input(path: &Path) -> Result<Box<dyn Read>> {
+pub(super) fn input(path: &Path) -> Result<Box<dyn Read>> {
     if path == Path::new("-") {
         #[cfg(windows)]
         {
@@ -539,6 +539,32 @@ fn input(path: &Path) -> Result<Box<dyn Read>> {
             File::open(path).with_context(|| format!("open PAC {}", path.display()))?,
         ))
     }
+}
+
+pub(super) fn enter_fastboot(options: &Cli, settings: &Config, directory: &Path) -> Result<()> {
+    ensure!(
+        options.inputs().is_empty(),
+        "device listing must not consume PAC inputs"
+    );
+    if options.fda.is_some() {
+        stream_inputs(
+            options,
+            settings,
+            &Actions::default(),
+            directory,
+            UsbTarget::new(options, settings)?,
+        )?;
+    } else {
+        let mut target = UsbTarget::new(options, settings)?;
+        require_fastboot(&mut target)?;
+    }
+    Ok(())
+}
+
+fn require_fastboot(target: &mut impl Target) -> Result<()> {
+    target.connect()?;
+    ensure!(!target.is_rom(), "device is in ROM/download-loader mode; supply --fda PATH to enter fastboot, or specify a PAC for an offline listing");
+    Ok(())
 }
 
 fn stage_flash_stdin(
@@ -897,6 +923,24 @@ mod tests {
         assert_eq!(client.transport.writes[3], b"flash:boot");
         drop(file);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn listing_without_fda_accepts_fastboot_and_explains_rom_mode_without_writes() {
+        for rom in [false, true] {
+            let mut peer = Peer {
+                rom,
+                ..Peer::default()
+            };
+            let result = require_fastboot(&mut peer);
+            if rom {
+                assert!(result.unwrap_err().to_string().contains("--fda PATH"));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(peer.connections.get(), 1);
+            assert!(peer.calls.is_empty());
+        }
     }
 
     #[test]
