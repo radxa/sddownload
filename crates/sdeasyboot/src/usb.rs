@@ -202,13 +202,72 @@ pub fn wait_for_mode(serial: &str, timeout: Duration, mode: Mode) -> Result<Devi
     }
 }
 
+/// The timeout limits silence between successful USB transfers, not the total
+/// duration of a connection, command, or image. Zero keeps libusb's unlimited
+/// timeout convention. Explicit clock values keep the policy testable without
+/// hardware or sleeps.
+struct IdleTimeout {
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl IdleTimeout {
+    fn new(timeout: Duration, now: Instant) -> Result<Self> {
+        let mut idle = Self {
+            timeout,
+            deadline: None,
+        };
+        idle.reset(now)?;
+        Ok(idle)
+    }
+
+    fn reset(&mut self, now: Instant) -> Result<()> {
+        self.deadline = if self.timeout.is_zero() {
+            None
+        } else {
+            Some(
+                now.checked_add(self.timeout)
+                    .context("USB timeout exceeds clock range")?,
+            )
+        };
+        Ok(())
+    }
+
+    fn remaining(&self, now: Instant) -> Result<Duration> {
+        match self.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    return Err(anyhow::Error::new(rusb::Error::Timeout).context(format!(
+                        "USB transfer inactivity timeout ({:?} without progress)",
+                        self.timeout
+                    )));
+                }
+                Ok(remaining)
+            }
+            None => Ok(Duration::ZERO),
+        }
+    }
+
+    fn transfer(
+        &mut self,
+        mut clock: impl FnMut() -> Instant,
+        operation: impl FnOnce(Duration) -> rusb::Result<usize>,
+    ) -> Result<usize> {
+        let count = operation(self.remaining(clock())?)?;
+        if count > 0 {
+            self.reset(clock())?;
+        }
+        Ok(count)
+    }
+}
+
 pub struct UsbLink {
     handle: DeviceHandle<Context>,
     interface: u8,
     input: u8,
     output: u8,
-    timeout: Duration,
-    deadline: Option<Instant>,
+    idle: IdleTimeout,
 }
 
 impl UsbLink {
@@ -232,45 +291,18 @@ impl UsbLink {
             handle.set_alternate_setting(info.interface, info.alternate)?;
         }
 
-        let mut link = Self {
+        Ok(Self {
             handle,
             interface: info.interface,
             input: info.input,
             output: info.output,
-            timeout,
-            deadline: None,
-        };
-        link.set_timeout(timeout)?;
-
-        Ok(link)
+            idle: IdleTimeout::new(timeout, Instant::now())?,
+        })
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.timeout = timeout;
-        self.deadline = if timeout.is_zero() {
-            None
-        } else {
-            Some(
-                Instant::now()
-                    .checked_add(timeout)
-                    .context("USB timeout exceeds clock range")?,
-            )
-        };
-
+        self.idle = IdleTimeout::new(timeout, Instant::now())?;
         Ok(())
-    }
-
-    fn remaining(&self) -> Result<Duration> {
-        match self.deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-
-                ensure!(!remaining.is_zero(), "USB operation timed out");
-
-                Ok(remaining)
-            }
-            None => Ok(self.timeout),
-        }
     }
 }
 
@@ -283,8 +315,11 @@ impl BulkTransport for UsbLink {
         }
 
         let count = self
-            .handle
-            .read_bulk(self.input, &mut buffer[..n], self.remaining()?)?;
+            .idle
+            .transfer(Instant::now, |timeout| {
+                self.handle.read_bulk(self.input, &mut buffer[..n], timeout)
+            })
+            .with_context(|| format!("USB bulk read (inactivity limit {:?})", self.idle.timeout))?;
 
         ensure!(count > 0, "USB disconnected/empty read");
 
@@ -292,11 +327,20 @@ impl BulkTransport for UsbLink {
     }
 
     fn write(&mut self, buffer: &[u8]) -> Result<usize> {
-        Ok(self.handle.write_bulk(
-            self.output,
-            &buffer[..buffer.len().min(0x4000)],
-            self.remaining()?,
-        )?)
+        let n = buffer.len().min(0x4000);
+        if n == 0 {
+            return Ok(0);
+        }
+        let count = self
+            .idle
+            .transfer(Instant::now, |timeout| {
+                self.handle.write_bulk(self.output, &buffer[..n], timeout)
+            })
+            .with_context(|| {
+                format!("USB bulk write (inactivity limit {:?})", self.idle.timeout)
+            })?;
+        ensure!(count > 0, "USB bulk write made no progress");
+        Ok(count)
     }
 }
 
@@ -349,6 +393,121 @@ impl<T: BulkTransport> EasybootClient<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn active_full_partial_and_response_transfers_can_exceed_total_timeout() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let limit = Duration::from_secs(400);
+        let mut idle = IdleTimeout::new(limit, start).unwrap();
+        for index in 0..1000 {
+            let count = [0x4000, 1, 64][index % 3];
+            assert_eq!(
+                idle.transfer(
+                    || now.get(),
+                    |timeout| {
+                        assert_eq!(timeout, limit);
+                        now.set(now.get() + Duration::from_secs(1));
+                        Ok(count)
+                    }
+                )
+                .unwrap(),
+                count
+            );
+        }
+        assert!(now.get().duration_since(start) > limit);
+        assert_eq!(idle.remaining(now.get()).unwrap(), limit);
+    }
+
+    #[test]
+    fn stalled_transfer_uses_remaining_idle_budget_and_does_not_renew_it() {
+        let start = Instant::now();
+        let now = Cell::new(start + Duration::from_secs(2));
+        let mut idle = IdleTimeout::new(Duration::from_secs(5), start).unwrap();
+        let error = idle
+            .transfer(
+                || now.get(),
+                |timeout| {
+                    assert_eq!(timeout, Duration::from_secs(3));
+                    now.set(start + Duration::from_secs(5));
+                    Err(rusb::Error::Timeout)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<rusb::Error>(),
+            Some(&rusb::Error::Timeout)
+        );
+        let called = Cell::new(false);
+        let error = idle
+            .transfer(
+                || now.get(),
+                |_| {
+                    called.set(true);
+                    Ok(1)
+                },
+            )
+            .unwrap_err();
+        assert!(!called.get());
+        assert!(error.to_string().contains("inactivity timeout"));
+        assert_eq!(
+            error.downcast_ref::<rusb::Error>(),
+            Some(&rusb::Error::Timeout)
+        );
+    }
+
+    #[test]
+    fn zero_length_result_does_not_count_as_transfer_progress() {
+        let start = Instant::now();
+        let mut idle = IdleTimeout::new(Duration::from_secs(5), start).unwrap();
+        let almost_expired = start + Duration::from_secs(4);
+        assert_eq!(idle.transfer(|| almost_expired, |_| Ok(0)).unwrap(), 0);
+        assert_eq!(
+            idle.remaining(almost_expired).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert!(idle.remaining(start + Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn progress_renews_timeout_from_transfer_completion() {
+        let start = Instant::now();
+        let now = Cell::new(start + Duration::from_secs(4));
+        let mut idle = IdleTimeout::new(Duration::from_secs(5), start).unwrap();
+        idle.transfer(
+            || now.get(),
+            |timeout| {
+                assert_eq!(timeout, Duration::from_secs(1));
+                now.set(start + Duration::from_secs(5));
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert_eq!(idle.remaining(now.get()).unwrap(), Duration::from_secs(5));
+        assert_eq!(
+            idle.remaining(start + Duration::from_secs(9)).unwrap(),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn zero_timeout_remains_unlimited_and_unrepresentable_values_are_rejected() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(1_000_000);
+        let mut idle = IdleTimeout::new(Duration::ZERO, start).unwrap();
+        idle.transfer(
+            || later,
+            |timeout| {
+                assert_eq!(timeout, Duration::ZERO);
+                Ok(64)
+            },
+        )
+        .unwrap();
+        assert_eq!(idle.remaining(later).unwrap(), Duration::ZERO);
+        assert!(IdleTimeout::new(Duration::MAX, start).is_err());
+    }
+
     struct Peer(Vec<u8>);
     impl BulkTransport for Peer {
         fn read(&mut self, _: &mut [u8]) -> Result<usize> {

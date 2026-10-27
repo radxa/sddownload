@@ -77,11 +77,19 @@ Additional options:
 No application configuration file is implicitly loaded from the working
 directory, executable directory, or Python distribution. Without `--config`,
 the built-in values match `bin/configure/app.json`: 60-second device
-detection, 20-second stage/DA operations, a 400-second default operation
-timeout, and automatic erasure of empty `exception_log`/`misc` partitions.
+detection, 20-second stage/DA USB inactivity limits, a 400-second default USB
+inactivity limit, and automatic erasure of empty `exception_log`/`misc` partitions.
 Explicit JSON values override these defaults. A timeout of zero disables
 that timeout. Legacy `settings`/`log` fields are accepted; `--debug` controls
 Rust's diagnostics and retention of temporary cached images.
+
+USB timeouts measure inactivity, not total flashing duration. Every successful
+nonempty USB read or write renews the configured timeout window, including
+partial writes and device INFO replies. A transfer that keeps making progress
+can run longer than 400 seconds. A stalled bulk operation or silent device
+response still times out, and failed/zero-byte transfers do not renew the
+window. Device-discovery timeouts remain limits on waiting for a device to
+appear. A timeout of zero continues to disable that limit.
 
 Example configuration:
 
