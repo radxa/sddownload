@@ -253,7 +253,7 @@ fn produce(
     let mut previous_direct = false;
     if let Some(path) = &options.fda {
         stop.check()?;
-        eprintln!("FDA image: {}", path.display());
+        sdeasyboot::statusln!("FDA image: {}", path.display());
         let mut source =
             open(path, stop).with_context(|| format!("open FDA {}", path.display()))?;
         let fda = cache_fda(directory, options.debug, |writer| {
@@ -272,7 +272,7 @@ fn produce(
     }
     for (storage, path) in options.inputs() {
         stop.check()?;
-        eprintln!("Streaming PAC: {}", path.display());
+        sdeasyboot::statusln!("Streaming PAC: {}", path.display());
         let mut pac = PacStream::new(open(path, stop)?, !options.skip_verify)?;
         ensure!(
             pac.version == u32::from(storage == "pac"),
@@ -343,9 +343,9 @@ fn produce(
                     .prefix("payload-")
                     .disable_cleanup(options.debug)
                     .tempfile_in(directory)?;
-                eprintln!("Caching {} ({} bytes)", entry.partition, size);
+                sdeasyboot::statusln!("Caching {} ({} bytes)", entry.partition, size);
                 if options.debug {
-                    eprintln!("Cache file: {}", file.path().display());
+                    sdeasyboot::statusln!("Cache file: {}", file.path().display());
                 }
                 let (mut writer, file) = file.into_parts();
                 let progress = Arc::new(Progress {
@@ -398,7 +398,7 @@ fn produce(
                 }
             }
         }
-        eprintln!(
+        sdeasyboot::statusln!(
             "PAC consumed{}: {}",
             if options.skip_verify {
                 " (CRC skipped)"

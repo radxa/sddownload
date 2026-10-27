@@ -165,7 +165,7 @@ impl<T: BulkTransport> FastbootClient<T> {
                 FastBootResponse::Data(n) => return Ok(Response::Data(n.into())),
                 FastBootResponse::Fail(s) => return Err(DeviceFailure(s).into()),
                 FastBootResponse::Info(s) | FastBootResponse::Text(s) => {
-                    eprintln!("{s}");
+                    crate::statusln!("{s}");
                     self.information.push(s);
                 }
             }
@@ -323,7 +323,7 @@ impl<T: BulkTransport> FastbootClient<T> {
             }
 
             Err(error) if error.downcast_ref::<DeviceFailure>().is_some() => {
-                eprintln!("max-download-size unavailable ({error}); using 64 MiB");
+                crate::statusln!("max-download-size unavailable ({error}); using 64 MiB");
                 64 * 1024 * 1024
             }
 

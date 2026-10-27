@@ -245,7 +245,7 @@ pub fn execute(options: &Cli) -> Result<()> {
     let temporary = tempfile::Builder::new().prefix("sddownload-").tempdir()?;
     let temporary = if options.debug {
         let path = temporary.keep();
-        eprintln!("Debug images retained in {}", path.display());
+        sdeasyboot::statusln!("Debug images retained in {}", path.display());
         Temporary::Kept(path)
     } else {
         Temporary::Owned(temporary)
@@ -254,9 +254,9 @@ pub fn execute(options: &Cli) -> Result<()> {
     if options.unpac_path.is_none() {
         streaming::download(options, &settings, &actions, temporary.path())?;
         if actions.read.iter().any(|(_, path)| path == Path::new("-")) {
-            eprintln!("Download successfully");
+            sdeasyboot::statusln!("Download successfully");
         } else {
-            println!("Download successfully");
+            sdeasyboot::console::suspend(|| println!("Download successfully"));
         }
         return Ok(());
     }
@@ -289,10 +289,10 @@ pub fn execute(options: &Cli) -> Result<()> {
     let plan = Plan::prepare(&extraction, &settings, temporary.path())?;
 
     if options.debug {
-        eprintln!("Download plan: {plan:#?}");
+        sdeasyboot::statusln!("Download plan: {plan:#?}");
     }
 
-    println!("Unpac successfully");
+    sdeasyboot::console::suspend(|| println!("Unpac successfully"));
 
     Ok(())
 }
@@ -329,7 +329,7 @@ pub fn run_from(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> 
     match execute(&options) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("sddownload: {error:#}");
+            sdeasyboot::statusln!("sddownload: {error:#}");
             1
         }
     }

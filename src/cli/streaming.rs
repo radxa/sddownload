@@ -93,7 +93,7 @@ impl Target for UsbTarget<'_> {
                 &key,
                 self.settings.timeout("detect_dev"),
             ) {
-                eprintln!(
+                sdeasyboot::statusln!(
                     "ADB auto-reboot unavailable: {error:#}; detecting download mode directly"
                 );
             }
@@ -147,7 +147,7 @@ impl Target for UsbTarget<'_> {
         if plan::is_da(partition) && self.stage()? {
             return Ok(());
         }
-        eprintln!("Bootstrap {partition}");
+        sdeasyboot::statusln!("Bootstrap {partition}");
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
             flash_with_progress(client, partition, reader, size, false)
         })?;
@@ -221,7 +221,7 @@ fn cache_fda(
         .disable_cleanup(debug)
         .tempfile_in(directory)?;
     if debug {
-        eprintln!("FDA cache file: {}", file.path().display());
+        sdeasyboot::statusln!("FDA cache file: {}", file.path().display());
     }
     let size = copy(file.as_file_mut())?;
     ensure!(size > 0, "FDA image is empty");
@@ -303,9 +303,9 @@ fn cache(
         .prefix("payload-")
         .disable_cleanup(debug)
         .tempfile_in(directory)?;
-    eprintln!("Caching {} ({} bytes)", entry.partition, entry.size);
+    sdeasyboot::statusln!("Caching {} ({} bytes)", entry.partition, entry.size);
     if debug {
-        eprintln!("Cache file: {}", file.path().display());
+        sdeasyboot::statusln!("Cache file: {}", file.path().display());
     }
     ensure!(
         io::copy(reader, &mut file)? == entry.size,
@@ -367,7 +367,7 @@ impl<T: Target> Engine<'_, T> {
                     "ELF FDA requires J-Link, which is not supported"
                 );
                 let mut source = io::Cursor::new(prefix).chain(reader);
-                eprintln!("ROM FDA: {} bytes", entry.size);
+                sdeasyboot::statusln!("ROM FDA: {} bytes", entry.size);
                 self.target.loader(&mut source, entry.size)?;
                 io::copy(&mut source, &mut io::sink())?;
             } else {
@@ -385,7 +385,7 @@ impl<T: Target> Engine<'_, T> {
                 .prefix("slot-")
                 .disable_cleanup(self.options.debug)
                 .tempfile_in(self.directory)?;
-            eprintln!(
+            sdeasyboot::statusln!(
                 "Caching {} for slot B while flashing slot A",
                 entry.partition
             );
@@ -579,9 +579,9 @@ fn stage_flash_stdin(
         .prefix("flash-stdin-")
         .disable_cleanup(debug)
         .tempfile_in(directory)?;
-    eprintln!("Staging flash image from stdin");
+    sdeasyboot::statusln!("Staging flash image from stdin");
     if debug {
-        eprintln!("Flash stdin cache file: {}", file.path().display());
+        sdeasyboot::statusln!("Flash stdin cache file: {}", file.path().display());
     }
     ensure!(
         io::copy(source, &mut file)? > 0,
@@ -711,7 +711,7 @@ fn validated_inputs<T: Target>(
     };
     let mut empty = BTreeSet::new();
     if let Some(path) = &options.fda {
-        eprintln!("FDA image: {}", path.display());
+        sdeasyboot::statusln!("FDA image: {}", path.display());
         let mut source = input(path).with_context(|| format!("open FDA {}", path.display()))?;
         let fda = cache_fda(directory, options.debug, |writer| {
             Ok(io::copy(&mut source, writer)?)
@@ -723,7 +723,7 @@ fn validated_inputs<T: Target>(
         }
     }
     for (index, (storage, path)) in inputs.iter().enumerate() {
-        eprintln!("Streaming PAC: {}", path.display());
+        sdeasyboot::statusln!("Streaming PAC: {}", path.display());
         let mut pac = PacStream::new(input(path)?, !options.skip_verify)?;
         ensure!(
             pac.version == u32::from(*storage == "pac"),
@@ -768,7 +768,7 @@ fn validated_inputs<T: Target>(
                 }
             }
         }
-        eprintln!(
+        sdeasyboot::statusln!(
             "PAC consumed{}: {}",
             if options.skip_verify {
                 " (CRC skipped)"

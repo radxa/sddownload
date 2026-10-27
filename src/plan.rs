@@ -40,7 +40,7 @@ impl Plan {
         let mut ssb_da = None;
 
         for (storage, path) in options.inputs() {
-            eprintln!("Opening PAC: {}", path.display());
+            sdeasyboot::statusln!("Opening PAC: {}", path.display());
             let pac = Pac::open(path, !options.skip_verify)
                 .with_context(|| format!("load {storage} PAC {}", path.display()))?;
 
@@ -70,19 +70,19 @@ impl Plan {
                 }
             }
 
-            eprintln!("Extracting PAC to: {}", output.display());
+            sdeasyboot::statusln!("Extracting PAC to: {}", output.display());
             let mut current = 0;
             let total = pac.entries.len();
             let extracted = pac.extract_with_progress(&output, |entry, destination| {
                 current += 1;
-                eprintln!(
+                sdeasyboot::statusln!(
                     "[{current}/{total}] Extracting {} ({} bytes) -> {}",
                     entry.partition,
                     entry.size,
                     destination.display()
                 );
             })?;
-            eprintln!(
+            sdeasyboot::statusln!(
                 "Extracted {} files from {}",
                 extracted.len(),
                 path.display()

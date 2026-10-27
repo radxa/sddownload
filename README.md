@@ -252,15 +252,25 @@ Each flash operation reports a progress bar on stderr with flashed/total image
 size, recent USB transfer speed, and an estimated remaining time in `mm:ss`:
 
 ```text
-Flash emmc1$rootfs [========        ]  50% 256.0 MiB/512.0 MiB 32.0 MiB/s ETA 00:08
+  Flash emmc1$rootfs                    [==================>                   ]  50%   256.0 MiB /  512.0 MiB    32.0 MiB/s  ETA    00:08
 ```
 
+Partition labels are indented and padded to a fixed column. The bar fills the
+remaining terminal width, and percentage, sizes, speed, ETA, and status have
+reserved field widths so their columns do not move as values change. Narrow
+terminals place the label or statistics on separate rows to leave room for the
+bar. Labels longer than the reserved column are abbreviated in the bar and
+printed in full on a separate line.
+
 The bar updates in place on a terminal; redirected stderr receives periodic
-lines. `--:--` means there is not enough progress to estimate the time yet.
+lines. Caching messages, device INFO replies, and other diagnostics share the
+same output coordinator: they temporarily clear the live bar, print complete
+lines, and redraw it. Completed bars remain in the output history.
+`--:--` means there is not enough progress to estimate the time yet.
 Sparse image sizes include skipped holes, while speed counts only transferred
 payload bytes. The estimate follows recent image progress and excludes unknown
-device-side write/verification delays. At 100%, the status remains `waiting for
-device` until the final response succeeds; failures are marked `failed`. A/B
+device-side write/verification delays. At 100%, the status remains `waiting`
+for the device until the final response succeeds; failures are marked `failed`. A/B
 slots and explicit `--flash` images each get their own progress bar.
 
 On Linux, Darwin, and Windows, normal mode uses a background input worker while

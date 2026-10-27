@@ -7,6 +7,8 @@ description = "Native SemiDrive easyboot, extended fastboot and ADB transports"
 
 [dependencies]
 anyhow = "1"
+indicatif = "0.18"
+console = "0.16"
 rusb = "0.9"
 fastboot-protocol = { version = "0.4", default-features = false }
 libadb = { version = "0.6", default-features = false, features = ["host-keys"] }

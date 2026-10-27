@@ -49,7 +49,7 @@ fn pac_rows(options: &Cli) -> Result<Vec<PacListing>> {
     options.validate_stdin()?;
     let mut listings = vec![];
     for (storage, path) in options.inputs() {
-        eprintln!("Inspecting PAC: {}", path.display());
+        sdeasyboot::statusln!("Inspecting PAC: {}", path.display());
         let source = path.display().to_string();
         let resources = if path == Path::new("-") {
             read_resources(
@@ -116,7 +116,7 @@ fn print_pac(options: &Cli, output: &mut impl Write) -> Result<()> {
     } else {
         "metadata only; CRCs not checked (use --verify-first for full verification)"
     };
-    eprintln!("PAC listing: {count} resources; {verification}. Names come from PAC tables; no slot names are inferred. IMAGE_BYTES is the PAC payload size, not device partition capacity. FDA/download agents and PAC containers are not ordinary flash/read partitions.");
+    sdeasyboot::statusln!("PAC listing: {count} resources; {verification}. Names come from PAC tables; no slot names are inferred. IMAGE_BYTES is the PAC payload size, not device partition capacity. FDA/download agents and PAC containers are not ordinary flash/read partitions.");
     output.flush()?;
     Ok(())
 }
@@ -134,7 +134,7 @@ pub(super) fn run(options: &Cli) -> Result<()> {
         .tempdir()?;
     if options.debug {
         let path = directory.keep();
-        eprintln!("Debug images retained in {}", path.display());
+        sdeasyboot::statusln!("Debug images retained in {}", path.display());
         streaming::enter_fastboot(options, &settings, &path)?;
     } else {
         streaming::enter_fastboot(options, &settings, directory.path())?;
@@ -143,7 +143,7 @@ pub(super) fn run(options: &Cli) -> Result<()> {
         client.list_partitions()
     })?;
     if let Some(warning) = listing.warning {
-        eprintln!("Partial fastboot partition listing: {warning}");
+        sdeasyboot::statusln!("Partial fastboot partition listing: {warning}");
     }
     let mut output = io::stdout().lock();
     let rows: Vec<_> = listing
@@ -170,7 +170,7 @@ pub(super) fn run(options: &Cli) -> Result<()> {
         &["PARTITION", "SIZE_BYTES", "TYPE", "LOGICAL"],
         &rows,
     )?;
-    eprintln!("Fastboot listing contains only device-advertised names and may be incomplete; '-' means unavailable. Use the exact PARTITION name with --read or --flash.");
+    sdeasyboot::statusln!("Fastboot listing contains only device-advertised names and may be incomplete; '-' means unavailable. Use the exact PARTITION name with --read or --flash.");
     output.flush()?;
     Ok(())
 }
