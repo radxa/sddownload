@@ -257,10 +257,12 @@ zstd -dc global.pac.zst | sddownload --emmc1 -
 ```
 
 Each flash operation reports a progress bar on stderr with flashed/total image
-size, recent USB transfer speed, and an estimated remaining time in `mm:ss`:
+size. While running, `NOW` shows the recent USB transfer speed and `ETA` shows
+estimated remaining time in `mm:ss`. The completed row switches to `AVG` for
+the partition's average speed and `TIME` for its elapsed flash time:
 
 ```text
-  Flash emmc1$rootfs                    [==================>                   ]  50%   256.0 MiB /  512.0 MiB    32.0 MiB/s  ETA    00:08
+  Flash emmc1$rootfs                    [======================================] 100%   512.0 MiB               AVG   28.4 MiB/s  TIME    00:18.028     done
 ```
 
 Partition labels are indented and padded to a fixed column. The bar fills the
@@ -274,6 +276,13 @@ The bar updates in place on a terminal; redirected stderr receives periodic
 lines. Caching messages, device INFO replies, and other diagnostics share the
 same output coordinator: they temporarily clear the live bar, print complete
 lines, and redraw it. Completed bars remain in the output history.
+`TIME` uses `mm:ss.mmm`, retaining milliseconds for fast partitions. It includes
+input waits, verification, and the final device response within the flash
+operation. `AVG` divides actual transferred payload bytes by that full elapsed
+time. Successful rows omit the redundant total size while reserving its column
+space, keeping `AVG`/`TIME` aligned with live `NOW`/`ETA` fields. Failed operations
+also show elapsed time and average speed, retaining their flashed/total sizes
+and `failed` status.
 `--:--` means there is not enough progress to estimate the time yet.
 Sparse image sizes include skipped holes, while speed counts only transferred
 payload bytes. The estimate follows recent image progress and excludes unknown

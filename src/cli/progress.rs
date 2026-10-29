@@ -23,9 +23,14 @@ pub(super) struct FlashProgress {
 struct Meter {
     state: Option<TransferProgress>,
     samples: VecDeque<(Duration, TransferProgress)>,
+    finished_elapsed: Option<Duration>,
 }
 
 impl Meter {
+    fn finish_at(&mut self, elapsed: Duration) {
+        self.finished_elapsed = Some(elapsed);
+    }
+
     fn record(&mut self, elapsed: Duration, state: TransferProgress) {
         self.state = Some(state);
         self.samples.push_back((elapsed, state));
@@ -54,14 +59,37 @@ impl Meter {
         let state = self.state?;
         let completed = state.completed.min(state.total);
         let percent = (u128::from(completed) * 100 / u128::from(state.total.max(1))) as usize;
-        let (speed, logical_speed) = self.rates();
-        let eta = if completed == state.total {
-            "00:00".into()
-        } else if logical_speed > 0.0 {
-            let seconds = ((state.total - completed) as f64 / logical_speed).ceil() as u64;
-            format!("{:02}:{:02}", seconds / 60, seconds % 60)
+        let (recent_speed, logical_speed) = self.rates();
+        let (speed, speed_label, time_label, time) = if result.is_some() {
+            let elapsed = self.finished_elapsed.unwrap_or_else(|| {
+                self.samples
+                    .back()
+                    .map(|(elapsed, _)| *elapsed)
+                    .unwrap_or_default()
+            });
+            let seconds = elapsed.as_secs_f64();
+            let average = if seconds > 0.0 {
+                state.transferred as f64 / seconds
+            } else {
+                0.0
+            };
+            let time = format!(
+                "{:02}:{:02}.{:03}",
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60,
+                elapsed.subsec_millis()
+            );
+            (average, "AVG", "TIME", time)
         } else {
-            "--:--".into()
+            let eta = if completed == state.total {
+                "00:00".into()
+            } else if logical_speed > 0.0 {
+                let seconds = ((state.total - completed) as f64 / logical_speed).ceil() as u64;
+                format!("{:02}:{:02}", seconds / 60, seconds % 60)
+            } else {
+                "--:--".into()
+            };
+            (recent_speed, "NOW", "ETA", eta)
         };
         let status = match result {
             Some(true) => "done",
@@ -69,10 +97,23 @@ impl Meter {
             None if completed == state.total => "waiting",
             None => "",
         };
+        let sizes = if result == Some(true) {
+            format!("{:>10}", bytes(completed as f64))
+        } else {
+            format!(
+                "{:>10} / {:>10}",
+                bytes(completed as f64),
+                bytes(state.total as f64)
+            )
+        };
+        // ETA reserves the four positions occupied by TIME's .mmm suffix.
+        let (time_width, fraction_padding) = if result.is_some() {
+            (12, "")
+        } else {
+            (8, "    ")
+        };
         Some(format!(
-            " {percent:3}%  {done:>10} / {total:>10}  {speed:>10}/s  ETA {eta:>8}  {status:>7}",
-            done = bytes(completed as f64),
-            total = bytes(state.total as f64),
+            " {percent:3}%  {sizes:<23}  {speed_label} {speed:>10}/s  {time_label:<4} {time:>time_width$}{fraction_padding}  {status:>7}",
             speed = bytes(speed),
         ))
     }
@@ -185,6 +226,9 @@ impl FlashProgress {
 
     pub(super) fn finish(&mut self, success: bool) {
         if !self.finished {
+            // Capture the whole partition operation, including time spent
+            // waiting for input, verification, and the final device response.
+            self.meter.finish_at(self.started.elapsed());
             self.render(Some(success));
             self.finished = true;
         }
@@ -222,9 +266,12 @@ mod tests {
         assert!(
             line.split_whitespace()
                 .collect::<Vec<_>>()
-                .windows(10)
+                .windows(11)
                 .any(|words| words
-                    == ["24%", "44.0", "MiB", "/", "180.0", "MiB", "2.0", "MiB/s", "ETA", "01:08"]),
+                    == [
+                        "24%", "44.0", "MiB", "/", "180.0", "MiB", "NOW", "2.0", "MiB/s", "ETA",
+                        "01:08"
+                    ]),
             "{line}"
         );
     }
@@ -245,9 +292,12 @@ mod tests {
         assert!(
             line.split_whitespace()
                 .collect::<Vec<_>>()
-                .windows(10)
+                .windows(11)
                 .any(|words| words
-                    == ["75%", "3.0", "KiB", "/", "4.0", "KiB", "1.0", "KiB/s", "ETA", "00:01"]),
+                    == [
+                        "75%", "3.0", "KiB", "/", "4.0", "KiB", "NOW", "1.0", "KiB/s", "ETA",
+                        "00:01"
+                    ]),
             "{line}"
         );
     }
@@ -289,5 +339,96 @@ mod tests {
         let long = prefix("emmc1$a_very_long_partition_name_with_a_distinct_tail");
         assert_eq!(long.chars().count(), prefix("FDA").chars().count());
         assert!(long.contains('~') && long.ends_with("distinct_tail"));
+    }
+
+    #[test]
+    fn completed_summary_uses_average_and_whole_partition_elapsed_time() {
+        let mib = 1024 * 1024;
+        let mut meter = Meter::default();
+        // Include initial input/header work and a six-second final device wait,
+        // rather than measuring only the interval between transfer callbacks.
+        meter.record(Duration::from_secs(2), state(0, 100 * mib));
+        meter.record(Duration::from_secs(4), state(100 * mib, 100 * mib));
+        let live = meter.statistics(None).unwrap();
+        assert!(
+            live.contains("NOW") && live.contains("50.0 MiB/s"),
+            "{live}"
+        );
+        meter.finish_at(Duration::from_secs(10));
+        let summary = meter.statistics(Some(true)).unwrap();
+        assert!(
+            summary
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|fields| fields == ["AVG", "10.0", "MiB/s", "TIME", "00:10.000", "done"]),
+            "{summary}"
+        );
+        assert!(!summary.contains("ETA"));
+        assert!(live.contains(" / "));
+        assert!(!summary.contains(" / "));
+        assert_eq!(summary.matches("100.0 MiB").count(), 1);
+        assert_eq!(live.find("NOW"), summary.find("AVG"));
+        assert_eq!(live.find("ETA"), summary.find("TIME"));
+        assert_eq!(live.find("00:00"), summary.find("00:10.000"));
+        assert_eq!(live.len(), summary.len());
+    }
+
+    #[test]
+    fn completed_summary_preserves_subsecond_time_and_handles_zero_duration() {
+        let mib = 1024 * 1024;
+        let mut meter = Meter::default();
+        meter.record(Duration::ZERO, state(0, 8 * mib));
+        meter.record(Duration::from_millis(100), state(8 * mib, 8 * mib));
+        meter.finish_at(Duration::from_millis(250));
+        let summary = meter.statistics(Some(true)).unwrap();
+        assert!(
+            summary.contains("32.0 MiB/s")
+                && summary.contains("TIME   ")
+                && summary.contains("00:00.250"),
+            "{summary}"
+        );
+        meter.finish_at(Duration::ZERO);
+        let summary = meter.statistics(Some(true)).unwrap();
+        assert!(
+            summary.contains("0 B/s") && summary.contains("00:00.000"),
+            "{summary}"
+        );
+        assert!(!summary.contains("NaN") && !summary.contains("inf"));
+    }
+
+    #[test]
+    fn final_average_counts_actual_payload_bytes_and_failures_keep_progress() {
+        let gib = 1024 * 1024 * 1024;
+        let mut meter = Meter::default();
+        meter.record(Duration::ZERO, state(0, 8 * gib));
+        meter.record(
+            Duration::from_secs(1),
+            TransferProgress {
+                completed: 8 * gib,
+                total: 8 * gib,
+                transferred: 3 * gib,
+            },
+        );
+        meter.finish_at(Duration::from_secs(3));
+        let summary = meter.statistics(Some(true)).unwrap();
+        assert!(
+            summary.contains("1.0 GiB/s") && summary.contains("00:03.000"),
+            "{summary}"
+        );
+
+        let mut failed = Meter::default();
+        failed.record(Duration::ZERO, state(0, 100));
+        failed.record(Duration::from_secs(1), state(50, 100));
+        failed.finish_at(Duration::from_secs(10));
+        let summary = failed.statistics(Some(false)).unwrap();
+        assert!(
+            summary.contains("50%")
+                && summary.contains(" / ")
+                && summary.contains("5 B/s")
+                && summary.contains("00:10.000")
+                && summary.ends_with("failed"),
+            "{summary}"
+        );
     }
 }
