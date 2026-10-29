@@ -5,8 +5,8 @@ use std::{
     collections::BTreeMap,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+        atomic::{AtomicU8, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
         Arc, Condvar, Mutex,
     },
 };
@@ -28,9 +28,6 @@ const CHUNK: usize = 64 * 1024;
 const POLL: Duration = Duration::from_millis(50);
 const INPUT_FAILED: u8 = 1;
 const USB_FAILED: u8 = 2;
-const BUSY: u8 = 0;
-const FLAT_READY: u8 = 1;
-const AGENT_READY: u8 = 2;
 
 #[derive(Default)]
 struct Stop(AtomicU8, #[cfg(windows)] windows::Cancellation);
@@ -145,6 +142,7 @@ impl Read for GrowingReader {
 }
 
 struct Pipe {
+    ready: Option<SyncSender<()>>,
     receiver: Receiver<Vec<u8>>,
     current: io::Cursor<Vec<u8>>,
     stop: Arc<Stop>,
@@ -166,6 +164,12 @@ impl Read for Pipe {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
+        }
+        self.stop.check()?;
+        if let Some(ready) = self.ready.take() {
+            ready.send(()).map_err(|_| {
+                io::Error::other("PAC input worker stopped before payload transfer")
+            })?;
         }
         loop {
             self.stop.check()?;
@@ -237,20 +241,16 @@ fn write_cache(writer: &mut impl Write, mut bytes: &[u8], stop: &Stop) -> io::Re
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn produce(
     options: &Cli,
     settings: &Config,
     actions: &Actions,
     directory: &Path,
     sender: &SyncSender<Work>,
-    mode: &AtomicU8,
-    in_flight: &AtomicUsize,
     stop: &Arc<Stop>,
     mut open: impl FnMut(&Path, &Arc<Stop>) -> Result<Box<dyn Read + Send>>,
 ) -> Result<()> {
     let mut empty = BTreeSet::new();
-    let mut previous_direct = false;
     if let Some(path) = &options.fda {
         stop.check()?;
         sdeasyboot::statusln!("FDA image: {}", path.display());
@@ -261,7 +261,6 @@ fn produce(
                 Ok(write_cache(writer, bytes, stop)?)
             })
         })?;
-        in_flight.fetch_add(1, Ordering::AcqRel);
         sender
             .send(Work::Entry {
                 payload: Payload::Cached(fda),
@@ -297,16 +296,15 @@ fn produce(
                 .map(|(rank, _)| rank)
                 .collect();
             let unknown = pac.has_pending_containers();
-            let ready = mode.swap(BUSY, Ordering::AcqRel);
-            let direct = loader(&entry).is_none()
-                && future.is_empty()
-                && (!unknown || ready == AGENT_READY)
-                && ((ready != BUSY && in_flight.load(Ordering::Acquire) == 0) || previous_direct);
+            // The consumer decides whether bootstrap dependencies require a
+            // replay cache. USB being busy never makes an image disk-backed.
+            let direct = loader(&entry).is_none();
             let size = entry.size;
-            in_flight.fetch_add(1, Ordering::AcqRel);
             if direct {
                 let (data_sender, data_receiver) = mpsc::sync_channel(4);
+                let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
                 let reader = Pipe {
+                    ready: Some(ready_sender),
                     receiver: data_receiver,
                     current: io::Cursor::new(vec![]),
                     stop: stop.clone(),
@@ -324,15 +322,23 @@ fn produce(
                         unknown,
                     })
                     .map_err(|_| anyhow::anyhow!("USB worker stopped"))?;
-                let result = copy_entry(&mut pac, stop, |bytes| {
-                    data_sender
-                        .send(bytes.to_vec())
-                        .map_err(|_| anyhow::anyhow!("USB payload reader stopped"))
-                })
-                .and_then(|count| {
-                    ensure!(count == size, "truncated PAC payload");
-                    Ok(())
-                });
+                // The consumer may first flush an older deferred image. Wait
+                // for its first read, not just receipt of the metadata, before
+                // consuming any bytes from this payload.
+                let result = ready_receiver
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("USB payload reader stopped before transfer"))
+                    .and_then(|()| {
+                        copy_entry(&mut pac, stop, |bytes| {
+                            data_sender
+                                .send(bytes.to_vec())
+                                .map_err(|_| anyhow::anyhow!("USB payload reader stopped"))
+                        })
+                    })
+                    .and_then(|count| {
+                        ensure!(count == size, "truncated PAC payload");
+                        Ok(())
+                    });
                 if result.is_err() {
                     stop.cancel(INPUT_FAILED);
                 }
@@ -384,7 +390,6 @@ fn produce(
                 progress.finish();
                 result?;
             }
-            previous_direct = direct;
         }
         for partition in &pac.empty {
             if matches!(storage, "emmc1" | "sd" | "pac") {
@@ -417,7 +422,6 @@ fn produce(
 struct Early<'a, T> {
     engine: Engine<'a, T>,
     committed: BTreeMap<u8, Cached>,
-    images_started: bool,
     stop: Arc<Stop>,
 }
 
@@ -457,20 +461,6 @@ impl<T: Target> Early<'_, T> {
         Ok(!self.engine.target.is_rom() && (!unknown || self.engine.target.has_agent()?))
     }
 
-    fn direct_mode(&mut self) -> Result<u8> {
-        if !self.engine.cached.is_empty() {
-            return Ok(BUSY);
-        }
-        if self.committed.is_empty() && !self.images_started {
-            return Ok(FLAT_READY);
-        }
-        Ok(if self.engine.target.has_agent()? {
-            AGENT_READY
-        } else {
-            FLAT_READY
-        })
-    }
-
     fn flush(&mut self, future: &[u8], unknown: bool) -> Result<()> {
         loop {
             self.stop.check()?;
@@ -508,7 +498,6 @@ impl<T: Target> Early<'_, T> {
         }
         while let Some(item) = self.engine.cached.pop_front() {
             self.stop.check()?;
-            self.images_started = true;
             self.engine.replay(item)?;
         }
         Ok(())
@@ -535,7 +524,6 @@ impl<T: Target> Early<'_, T> {
                 self.flush(future, unknown)?;
                 if self.can_flash(future, unknown)? {
                     self.stop.check()?;
-                    self.images_started = true;
                     self.engine.consume(&storage, &entry, &mut reader, false)?;
                 } else {
                     let item = cache(
@@ -556,27 +544,17 @@ impl<T: Target> Early<'_, T> {
 fn consume<T: Target>(
     early: &mut Early<'_, T>,
     receiver: &Receiver<Work>,
-    mode: &AtomicU8,
-    in_flight: &AtomicUsize,
     stop: &Stop,
 ) -> Result<BTreeSet<String>> {
     loop {
         stop.check()?;
-        let work = match receiver.try_recv() {
+        let work = match receiver.recv_timeout(POLL) {
             Ok(work) => work,
-            Err(TryRecvError::Empty) => {
-                mode.store(early.direct_mode()?, Ordering::Release);
-                match receiver.recv_timeout(POLL) {
-                    Ok(work) => work,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        bail!("PAC input worker stopped before completion")
-                    }
-                }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("PAC input worker stopped before completion")
             }
-            Err(TryRecvError::Disconnected) => bail!("PAC input worker stopped before completion"),
         };
-        mode.store(BUSY, Ordering::Release);
         stop.check()?;
         match work {
             Work::Entry {
@@ -584,9 +562,7 @@ fn consume<T: Target>(
                 future,
                 unknown,
             } => {
-                let result = early.accept(payload, &future, unknown);
-                in_flight.fetch_sub(1, Ordering::AcqRel);
-                result?;
+                early.accept(payload, &future, unknown)?;
             }
             Work::Done(empty) => {
                 early.flush(&[], false)?;
@@ -625,9 +601,10 @@ fn run_with_input<T: Target>(
 ) -> Result<(T, BTreeSet<String>)> {
     options.validate_stdin()?;
     let stop = Arc::new(Stop::default());
-    let mode = Arc::new(AtomicU8::new(FLAT_READY));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let (sender, receiver) = mpsc::sync_channel(16);
+    // Resource hand-off is a rendezvous: no later payload is read while the
+    // consumer is flashing/acknowledging the previous resource. The current
+    // payload alone uses the bounded four-chunk data pipe.
+    let (sender, receiver) = mpsc::sync_channel(0);
     let mut early = Early {
         engine: Engine {
             target,
@@ -637,7 +614,6 @@ fn run_with_input<T: Target>(
             cached: VecDeque::new(),
         },
         committed: BTreeMap::new(),
-        images_started: false,
         stop: stop.clone(),
     };
     thread::scope(|scope| {
@@ -647,8 +623,6 @@ fn run_with_input<T: Target>(
             receiver: Some(receiver),
         };
         let producer_stop = stop.clone();
-        let producer_mode = mode.clone();
-        let producer_in_flight = in_flight.clone();
         let producer = scope.spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 producer_stop.register_input()?;
@@ -658,8 +632,6 @@ fn run_with_input<T: Target>(
                     actions,
                     directory,
                     &sender,
-                    &producer_mode,
-                    &producer_in_flight,
                     &producer_stop,
                     open,
                 )
@@ -670,13 +642,7 @@ fn run_with_input<T: Target>(
             }
             result
         });
-        let result = consume(
-            &mut early,
-            cancel_on_drop.receiver.as_ref().unwrap(),
-            &mode,
-            &in_flight,
-            &stop,
-        );
+        let result = consume(&mut early, cancel_on_drop.receiver.as_ref().unwrap(), &stop);
         if result.is_err() {
             stop.cancel(USB_FAILED);
         }

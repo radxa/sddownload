@@ -1,7 +1,11 @@
 use super::super::tests::packet;
 use super::*;
 use clap::Parser;
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicBool, AtomicU64},
+    time::Instant,
+};
 
 #[cfg(unix)]
 fn input_pipe() -> (File, File) {
@@ -232,26 +236,6 @@ impl Target for Peer {
         if let Some(gate) = &self.gate {
             gate.flags.lock().unwrap().fda_started = true;
             gate.changed.notify_all();
-            // Model USB initialization holding the main thread. The input
-            // producer must still create and write the later rootfs cache.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if std::fs::read_dir(&self.cache)?
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        entry
-                            .metadata()
-                            .is_ok_and(|meta| meta.len() >= CHUNK as u64)
-                    })
-                {
-                    break;
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "input caching stopped during FDA initialization"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
         }
         self.rom = false;
         Ok(())
@@ -268,6 +252,9 @@ impl Target for Peer {
         ensure!(!self.fail_flash, "simulated USB failure");
         if name.ends_with("$rootfs") {
             if let Some(gate) = &self.gate {
+                // Only the retained FDA and agent caches are needed here;
+                // rootfs must use the memory pipe rather than a growing file.
+                assert_eq!(std::fs::read_dir(&self.cache)?.count(), 2);
                 gate.flags.lock().unwrap().rootfs_started = true;
                 gate.changed.notify_all();
             }
@@ -294,7 +281,7 @@ impl Read for GatedInput {
             self.gate.wait(&self.stop, |flags| flags.fda_started)?;
             if position >= self.rootfs_start + CHUNK as u64 {
                 // Withhold most of the payload until USB starts flashing it.
-                // Waiting for the entire cache to finish would deadlock here.
+                // Staging the whole image before flashing would deadlock here.
                 self.gate.wait(&self.stop, |flags| flags.rootfs_started)?;
             }
         }
@@ -311,7 +298,7 @@ impl Read for GatedInput {
 }
 
 #[test]
-fn fda_runs_early_input_caches_during_boot_and_flash_reads_a_growing_file() {
+fn fda_runs_early_and_ready_images_stream_without_payload_cache() {
     let directory = tempfile::tempdir().unwrap();
     let rootfs = vec![0x5a; CHUNK * 4];
     let images = packet(&[("rootfs", 6, &rootfs)]);
@@ -362,6 +349,207 @@ fn fda_runs_early_input_caches_during_boot_and_flash_reads_a_growing_file() {
         rootfs
     );
     assert!(gate.flags.lock().unwrap().rootfs_started);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn busy_flash_applies_backpressure_before_reading_the_next_payload() {
+    struct GuardedInput {
+        bytes: io::Cursor<Vec<u8>>,
+        next_payload: u64,
+        first_finished: Arc<AtomicBool>,
+        position: Arc<AtomicU64>,
+        forbidden_read: SyncSender<()>,
+    }
+    impl Read for GuardedInput {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.position() >= self.next_payload
+                && !self.first_finished.load(Ordering::Acquire)
+            {
+                let _ = self.forbidden_read.try_send(());
+                return Err(io::Error::other(
+                    "next payload read while current flash was busy",
+                ));
+            }
+            let count = self.bytes.read(buffer)?;
+            self.position
+                .store(self.bytes.position(), Ordering::Release);
+            Ok(count)
+        }
+    }
+    struct SlowPeer {
+        calls: Vec<(String, Vec<u8>)>,
+        first_finished: Arc<AtomicBool>,
+        position: Arc<AtomicU64>,
+        next_payload: u64,
+        forbidden_read: Receiver<()>,
+        cache: PathBuf,
+        first_flashes: usize,
+        deferred_first: bool,
+    }
+    impl Target for SlowPeer {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_rom(&self) -> bool {
+            false
+        }
+        fn has_agent(&mut self) -> Result<bool> {
+            Ok(!self.deferred_first)
+        }
+        fn loader(&mut self, _: &mut dyn Read, _: u64) -> Result<()> {
+            bail!("unexpected FDA")
+        }
+        fn bootstrap(&mut self, _: &str, _: &mut dyn Read, _: u64) -> Result<()> {
+            bail!("unexpected agent")
+        }
+        fn flash(&mut self, name: &str, source: &mut dyn Read, size: u64) -> Result<()> {
+            let needed_cache_files = usize::from(
+                self.calls.len() < self.first_flashes
+                    && (self.first_flashes == 2 || self.deferred_first),
+            );
+            assert_eq!(std::fs::read_dir(&self.cache)?.count(), needed_cache_files);
+            let mut data = vec![];
+            source.read_to_end(&mut data)?;
+            assert_eq!(data.len() as u64, size);
+            if self.calls.len() + 1 == self.first_flashes {
+                // Model slow on-device programming/verification after the last
+                // payload byte, before the command's successful response.
+                assert!(matches!(
+                    self.forbidden_read.recv_timeout(Duration::from_millis(100)),
+                    Err(RecvTimeoutError::Timeout)
+                ));
+                assert_eq!(self.position.load(Ordering::Acquire), self.next_payload);
+                assert_eq!(std::fs::read_dir(&self.cache)?.count(), needed_cache_files);
+                self.first_finished.store(true, Ordering::Release);
+            }
+            self.calls.push((name.into(), data));
+            Ok(())
+        }
+    }
+    // Cover ordinary streaming, A/B replay, and replaying an older deferred
+    // image before the newly handed-off payload is permitted to start reading.
+    for (ab, deferred_first) in [(false, false), (true, false), (false, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let first = vec![0x11; CHUNK * 2];
+        let second = vec![0x22; CHUNK * 8];
+        let third = b"last";
+        let bytes = if deferred_first {
+            let nested = packet(&[("second", 6, &second), ("third", 6, third)]);
+            packet(&[("first", 6, &first), ("nested", 7, &nested)])
+        } else {
+            packet(&[
+                (if ab { "first_a" } else { "first" }, 6, &first),
+                ("second", 6, &second),
+                ("third", 6, third),
+            ])
+        };
+        let next_payload = sdimage::pac::TABLE_END
+            + first.len() as u64
+            + if deferred_first {
+                sdimage::pac::TABLE_END
+            } else {
+                0
+            };
+        let first_finished = Arc::new(AtomicBool::new(false));
+        let position = Arc::new(AtomicU64::new(0));
+        let (forbidden_tx, forbidden_rx) = mpsc::sync_channel(1);
+        let peer = SlowPeer {
+            calls: vec![],
+            first_finished: first_finished.clone(),
+            position: position.clone(),
+            next_payload,
+            forbidden_read: forbidden_rx,
+            cache: directory.path().into(),
+            first_flashes: if ab { 2 } else { 1 },
+            deferred_first,
+        };
+        let mut input = Some(GuardedInput {
+            bytes: io::Cursor::new(bytes),
+            next_payload,
+            first_finished,
+            position,
+            forbidden_read: forbidden_tx,
+        });
+        let mut options = Cli::try_parse_from(["sddownload", "--emmc1", "-"]).unwrap();
+        options.b_part = ab;
+        let (peer, _) = run_with_input(
+            &options,
+            &Config::load(None).unwrap(),
+            &Actions::default(),
+            directory.path(),
+            peer,
+            |_, _| Ok(Box::new(input.take().unwrap())),
+        )
+        .unwrap();
+        let mut expected = if ab {
+            vec![
+                ("emmc1$$first_a".into(), first.clone()),
+                ("emmc1$$first_b".into(), first),
+            ]
+        } else {
+            vec![("emmc1$$first".into(), first)]
+        };
+        expected.extend(if deferred_first {
+            [
+                ("emmc1$nested$second".into(), second),
+                ("emmc1$nested$third".into(), third.to_vec()),
+            ]
+        } else {
+            [
+                ("emmc1$$second".into(), second),
+                ("emmc1$$third".into(), third.to_vec()),
+            ]
+        });
+        assert_eq!(peer.calls, expected);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn deferred_and_direct_images_preserve_physical_pac_order_after_bootstrap() {
+    let input = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = input.path().join("ordered.pac");
+    let nested = packet(&[("second", 6, b"B"), ("third", 6, b"C")]);
+    let mut bytes = packet(&[
+        ("first", 6, b"A"),
+        ("FDA", 0, b"ROM"),
+        ("OPSIDA", 1, b"agent"),
+        ("nested", 7, &nested),
+    ]);
+    // Header row order need not equal physical payload order. Forward traversal
+    // follows offsets; bootstrap is the only required reordering in this PAC.
+    for index in 0..128 {
+        bytes.swap(1024 + index, 1024 + 3 * 128 + index);
+    }
+    let mut crc = sdimage::BZIP2.digest();
+    crc.update(&bytes[..1020]);
+    crc.update(&bytes[1024..]);
+    bytes[1020..1024].copy_from_slice(&crc.finalize().to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    let options = Cli::try_parse_from(["sddownload", "--emmc1", path.to_str().unwrap()]).unwrap();
+    let (peer, _) = run(
+        &options,
+        &Config::load(None).unwrap(),
+        &Actions::default(),
+        directory.path(),
+        Peer {
+            rom: true,
+            ..Peer::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        peer.calls,
+        [
+            ("FDA".into(), b"ROM".to_vec()),
+            ("ospi1$da".into(), b"agent".to_vec()),
+            ("emmc1$$first".into(), b"A".to_vec()),
+            ("emmc1$nested$second".into(), b"B".to_vec()),
+            ("emmc1$nested$third".into(), b"C".to_vec())
+        ]
+    );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
@@ -580,7 +768,7 @@ fn target_panic_also_cancels_a_blocked_input_worker() {
 }
 
 #[test]
-fn usb_failure_closes_a_partially_written_cache_and_debug_can_retain_it() {
+fn usb_failure_cleans_bootstrap_caches_and_debug_can_retain_them() {
     let rootfs = vec![0x5a; CHUNK * 4];
     let bytes = packet(&[
         ("FDA", 0, b"ROM"),

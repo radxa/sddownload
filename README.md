@@ -292,16 +292,28 @@ slots and explicit `--flash` images each get their own progress bar.
 
 On Linux, Darwin, and Windows, normal mode uses a background input worker while
 the calling thread performs USB operations serially. The input worker parses
-headers, calculates CRCs, and continues reading/caching during FDA transfer,
-device initialization, and flashes. USB can read a growing cache file before
-the input worker finishes writing it: a `Caching ...` message does not mean
-that the entire file must be cached before flashing starts.
+headers, calculates CRCs, and feeds the current image through a bounded memory
+pipe. Resource hand-off is a rendezvous: the next selected payload is not read
+until the USB consumer has finished the preceding resource, including its
+verification and final device response. Only the current payload is buffered
+ahead (four 64-KiB pipe chunks, plus the producer/USB buffers). Some subsequent
+metadata may be read, and OS/SSH pipe buffers have their own bounds, but later
+payloads are not prefetched to disk merely because USB is busy.
 
-When USB is ready, single-use payloads use a bounded in-memory pipe without a
-temporary file. At a payload boundary, when USB is busy or the payload must
-wait for a loader, input prefetch uses temporary cache files. The work queue and pipe buffers apply
-backpressure. With `--b-part`, an A/B payload is cached while slot A is flashed,
-then replayed for slot B; an already cached payload reuses its existing file.
+Ordinary image payloads preserve forward physical PAC traversal order, including
+nested PACs. Header table order can differ from physical offsets, and the
+alphabetically sorted resource listing is not a flash sequence. Required FDA
+and download-agent bootstrap stages run first. Images that precede a required
+loader, or must wait for unresolved bootstrap metadata, are cached so the input
+can reach that dependency, then replayed in their original traversal order.
+Loader caches can still be read while the input worker finishes writing them.
+
+With `--b-part`, an A/B payload is cached while slot A is flashed, then replayed
+for slot B before proceeding to the next resource; an already deferred payload
+reuses its existing cache. `--verify-first` deliberately stages payloads for
+replay after full PAC validation. Selected loaders also remain cached for
+byte-for-byte late-copy checks. Raw FDA/`--flash` stdin inputs still need their
+separately documented staging to determine the input length.
 
 Normal mode commits to the first eligible FDA/download agent of each kind,
 without waiting for hypothetical replacements in unread nested headers. Known
@@ -312,7 +324,7 @@ use `--verify-first`. Later forward bootstrap stages (for example, an eMMC DA
 in a second PAC after an OSPI DA) can still run without replacing the FDA.
 
 There is no configurable cache limit; temporary storage must have enough free
-space for prefetched, deferred, and reused data. Payload caches are removed
+space for deferred, prevalidated, and reused data. Payload caches are removed
 after use, including on I/O/protocol failure. Selected loader files are kept
 until completion to compare late copies byte for byte. `--debug` retains cache
 files and the working directory. The temporary directory follows the platform
@@ -414,9 +426,10 @@ authentication is exercised against a simulated USB peer with a temporary
 RSA key. Tests do not access real USB devices.
 
 Concurrency tests use controlled input and simulated USB targets to verify
-early FDA startup, input progress during boot, reads from growing caches,
-duplicate/conflicting late loaders, cancellation with an open input pipe, and
-cleanup after errors or a target panic.
+early FDA startup, in-order streaming without payload caches, input backpressure
+while USB is busy, bootstrap/deferred-image ordering, duplicate/conflicting late
+loaders, cancellation with an open input pipe, and cleanup after errors or a
+target panic.
 
 Synthetic tests and successful Nix builds do not establish hardware
 equivalence with every SemiDrive firmware version. No live flash, erase,
