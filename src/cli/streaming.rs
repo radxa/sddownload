@@ -33,6 +33,9 @@ trait Target {
     fn loader(&mut self, reader: &mut dyn Read, size: u64) -> Result<()>;
     fn bootstrap(&mut self, partition: &str, reader: &mut dyn Read, size: u64) -> Result<()>;
     fn flash(&mut self, partition: &str, reader: &mut dyn Read, size: u64) -> Result<()>;
+    fn erase(&mut self, _partition: &str) -> Result<()> {
+        anyhow::bail!("target does not support explicit erase")
+    }
 }
 
 struct UsbTarget<'a> {
@@ -74,6 +77,16 @@ impl<'a> UsbTarget<'a> {
 }
 
 impl Target for UsbTarget<'_> {
+    fn erase(&mut self, partition: &str) -> Result<()> {
+        self.connect()?;
+        ensure!(
+            !self.is_rom(),
+            "ROM mode requires --fda or an FDA image from a PAC"
+        );
+        with_fastboot(self.options, self.settings.timeout("default"), |client| {
+            client.erase(partition)
+        })
+    }
     fn connect(&mut self) -> Result<()> {
         if self.rom.is_some() {
             return Ok(());
@@ -171,7 +184,7 @@ impl Target for UsbTarget<'_> {
         );
         self.stage()?;
         with_fastboot(self.options, self.settings.timeout(partition), |client| {
-            if partition.contains("partition") || partition.contains("emmc") {
+            if erase_before_flash(partition, !self.options.flash.is_empty()) {
                 client.erase(partition)?;
             }
             flash_with_progress(client, partition, reader, size, !self.options.skip_verify)
@@ -194,6 +207,12 @@ fn flash_with_progress<T: usb::BulkTransport>(
     result
 }
 
+fn erase_before_flash(partition: &str, explicit: bool) -> bool {
+    partition.contains("partition")
+        || partition.contains("emmc")
+        || (explicit && partition.contains("ssd"))
+}
+
 fn loader(entry: &Entry) -> Option<(u8, &'static str)> {
     match (entry.kind, entry.partition.contains("ssb")) {
         (PacFileType::Fda, false) => Some((0, "FDA")),
@@ -207,6 +226,66 @@ fn loader(entry: &Entry) -> Option<(u8, &'static str)> {
 
 fn overridden_fda(options: &Cli, entry: &Entry) -> bool {
     options.fda.is_some() && loader(entry).is_some_and(|(rank, _)| rank == 0)
+}
+
+fn wanted(options: &Cli, actions: &Actions, storage: &str, entry: &Entry) -> bool {
+    !overridden_fda(options, entry)
+        && (loader(entry).is_some()
+            || if actions.is_empty() {
+                entry.kind != PacFileType::OspiDa
+                    && !plan::is_boot(&plan::storage_partition(storage, &entry.partition))
+            } else {
+                actions
+                    .pac_flash
+                    .iter()
+                    .any(|selection| selection.matches(storage, entry))
+            })
+}
+
+struct SelectionTracker<'a> {
+    actions: &'a Actions,
+    found: Vec<bool>,
+}
+
+impl<'a> SelectionTracker<'a> {
+    fn new(actions: &'a Actions) -> Self {
+        Self {
+            actions,
+            found: vec![false; actions.pac_flash.len()],
+        }
+    }
+
+    fn observe(&mut self, storage: &str, entry: &Entry) -> Result<()> {
+        for (index, selection) in self.actions.pac_flash.iter().enumerate() {
+            if !selection.matches(storage, entry) {
+                continue;
+            }
+            ensure!(!matches!(entry.kind, PacFileType::Fda | PacFileType::OspiDa | PacFileType::Dloader | PacFileType::Pac),
+                "PAC resource {} is a bootstrap loader/container, not an image partition for --flash", selection.partition);
+            ensure!(
+                entry.size > 0,
+                "PAC resource {} has no image payload (empty entry)",
+                selection.partition
+            );
+            self.found[index] = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        let missing: Vec<_> = self
+            .actions
+            .pac_flash
+            .iter()
+            .zip(&self.found)
+            .filter(|(_, found)| !**found)
+            .map(|(selection, _)| {
+                format!("{} in {}", selection.partition, selection.path.display())
+            })
+            .collect();
+        ensure!(missing.is_empty(), "PAC --flash selection not found: {}. Use the exact resource name from --list-partitions, including any slot suffix", missing.join(", "));
+        Ok(())
+    }
 }
 
 // A raw stdin FDA has no size header. Stage it to disk to determine its length
@@ -237,6 +316,7 @@ fn cache_fda(
         storage: String::new(),
         entry: Entry {
             partition: "FDA".into(),
+            resource_name: "FDA".into(),
             kind: PacFileType::Fda,
             size,
             offset: 0,
@@ -340,15 +420,45 @@ struct Engine<'a, T> {
     options: &'a Cli,
     actions: &'a Actions,
     cached: VecDeque<Cached>,
+    actions_prepared: bool,
 }
 
 impl<T: Target> Engine<'_, T> {
     fn wanted(&self, storage: &str, entry: &Entry) -> bool {
-        !overridden_fda(self.options, entry)
-            && (loader(entry).is_some()
-                || (self.actions.is_empty()
-                    && entry.kind != PacFileType::OspiDa
-                    && !plan::is_boot(&plan::storage_partition(storage, &entry.partition))))
+        wanted(self.options, self.actions, storage, entry)
+    }
+
+    fn image_partitions(&self, storage: &str, entry: &Entry) -> Vec<String> {
+        if !self.actions.is_empty() {
+            return self
+                .actions
+                .pac_flash
+                .iter()
+                .filter(|selection| selection.matches(storage, entry))
+                .map(|selection| selection.partition.clone())
+                .collect();
+        }
+        let partition = plan::storage_partition(storage, &entry.partition);
+        if self.options.b_part && entry.slot_ab {
+            vec![format!("{partition}_a"), format!("{partition}_b")]
+        } else {
+            vec![partition]
+        }
+    }
+
+    fn prepare_actions(&mut self) -> Result<()> {
+        if !self.actions_prepared && !self.actions.pac_flash.is_empty() {
+            self.target.connect()?;
+            ensure!(
+                !self.target.is_rom(),
+                "ROM mode requires --fda or an FDA image from a PAC"
+            );
+            for (partition, _) in &self.actions.erase {
+                self.target.erase(partition)?;
+            }
+            self.actions_prepared = true;
+        }
+        Ok(())
     }
 
     fn consume(
@@ -379,8 +489,9 @@ impl<T: Target> Engine<'_, T> {
         if !self.wanted(storage, entry) {
             return Ok(());
         }
-        let partition = plan::storage_partition(storage, &entry.partition);
-        if self.options.b_part && entry.slot_ab && !cached {
+        self.prepare_actions()?;
+        let partitions = self.image_partitions(storage, entry);
+        if partitions.len() > 1 && !cached {
             let mut file = tempfile::Builder::new()
                 .prefix("slot-")
                 .disable_cleanup(self.options.debug)
@@ -393,22 +504,15 @@ impl<T: Target> Engine<'_, T> {
                 reader,
                 cache: file.as_file_mut(),
             };
-            self.target
-                .flash(&format!("{partition}_a"), &mut tee, entry.size)?;
+            self.target.flash(&partitions[0], &mut tee, entry.size)?;
             io::copy(&mut tee, &mut io::sink())?;
             file.flush()?;
-            self.target
-                .flash(&format!("{partition}_b"), &mut file.reopen()?, entry.size)?;
+            for partition in &partitions[1..] {
+                self.target
+                    .flash(partition, &mut file.reopen()?, entry.size)?;
+            }
         } else {
-            self.target.flash(
-                &if self.options.b_part && entry.slot_ab {
-                    format!("{partition}_a")
-                } else {
-                    partition
-                },
-                reader,
-                entry.size,
-            )?;
+            self.target.flash(&partitions[0], reader, entry.size)?;
         }
         Ok(())
     }
@@ -416,19 +520,15 @@ impl<T: Target> Engine<'_, T> {
     fn replay(&mut self, item: Cached) -> Result<()> {
         let mut source = item.reader()?;
         self.consume(&item.storage, &item.entry, &mut source, true)?;
-        if loader(&item.entry).is_none()
-            && self.wanted(&item.storage, &item.entry)
-            && self.options.b_part
-            && item.entry.slot_ab
-        {
-            self.target.flash(
-                &format!(
-                    "{}_b",
-                    plan::storage_partition(&item.storage, &item.entry.partition)
-                ),
-                &mut item.reader()?,
-                item.entry.size,
-            )?;
+        if loader(&item.entry).is_none() && self.wanted(&item.storage, &item.entry) {
+            for partition in self
+                .image_partitions(&item.storage, &item.entry)
+                .into_iter()
+                .skip(1)
+            {
+                self.target
+                    .flash(&partition, &mut item.reader()?, item.entry.size)?;
+            }
         }
         Ok(())
     }
@@ -635,17 +735,18 @@ pub(super) fn download(
             })?;
         }
     } else {
-        for (partition, _) in &actions.erase {
+        for (partition, _) in actions
+            .erase
+            .iter()
+            .filter(|_| actions.pac_flash.is_empty())
+        {
             with_fastboot(options, settings.timeout("default"), |client| {
                 client.erase(partition)
             })?;
         }
         for (partition, path) in &actions.flash {
             with_fastboot(options, settings.timeout(partition), |client| {
-                if partition.contains("partition")
-                    || partition.contains("emmc")
-                    || partition.contains("ssd")
-                {
+                if erase_before_flash(partition, true) {
                     client.erase(partition)?;
                 }
                 let mut file = if path == Path::new("-") {
@@ -708,8 +809,10 @@ fn validated_inputs<T: Target>(
         options,
         actions,
         cached: VecDeque::new(),
+        actions_prepared: false,
     };
     let mut empty = BTreeSet::new();
+    let mut selections = SelectionTracker::new(actions);
     if let Some(path) = &options.fda {
         sdeasyboot::statusln!("FDA image: {}", path.display());
         let mut source = input(path).with_context(|| format!("open FDA {}", path.display()))?;
@@ -731,6 +834,7 @@ fn validated_inputs<T: Target>(
         );
         let stage = options.verify_first || index + 1 != inputs.len();
         while let Some(entry) = pac.next_entry()? {
+            selections.observe(storage, &entry)?;
             if overridden_fda(options, &entry) {
                 continue;
             }
@@ -756,6 +860,9 @@ fn validated_inputs<T: Target>(
                 engine.entry(storage, entry, &mut pac, &future)?;
             }
         }
+        for entry in &pac.empty_entries {
+            selections.observe(storage, entry)?;
+        }
         for partition in &pac.empty {
             if matches!(*storage, "emmc1" | "sd" | "pac") {
                 let partition = plan::storage_partition(storage, partition);
@@ -778,6 +885,7 @@ fn validated_inputs<T: Target>(
             path.display()
         );
     }
+    selections.finish()?;
     if options.verify_first {
         // Strict mode has consumed and verified every PAC before ADB/USB writes.
         for item in &engine.cached {
@@ -836,6 +944,10 @@ mod tests {
     }
 
     impl Target for Peer {
+        fn erase(&mut self, partition: &str) -> Result<()> {
+            self.calls.push((format!("erase:{partition}"), vec![]));
+            Ok(())
+        }
         fn connect(&mut self) -> Result<()> {
             self.connections.set(self.connections.get() + 1);
             Ok(())
@@ -860,6 +972,7 @@ mod tests {
     fn entry(name: &str, kind: u32, size: u64) -> Entry {
         Entry {
             partition: name.into(),
+            resource_name: name.into(),
             kind: kind.into(),
             size,
             offset: 0,
@@ -888,6 +1001,378 @@ mod tests {
         crc.update(&bytes[1024..]);
         bytes[1020..1024].copy_from_slice(&crc.finalize().to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn pac_backed_flash_filters_images_uses_exact_slots_and_preserves_pac_order() {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        std::fs::write(
+            &path,
+            packet(&[
+                ("FDA", 0, b"ROM"),
+                ("OPSIDA", 1, b"agent"),
+                ("kernel_a", 6, b"A"),
+                ("unselected", 6, b"skip"),
+                ("rootfs", 6, b"ROOT"),
+                ("kernel_b", 6, b"B"),
+            ]),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Cli::try_parse_from([
+                "sddownload",
+                "--emmc1",
+                path.to_str().unwrap(),
+                "--flash",
+                "emmc1$$rootfs",
+                path.to_str().unwrap(),
+                "--flash",
+                "emmc1$$kernel_a",
+                path.to_str().unwrap(),
+                "--b-part",
+            ])
+            .unwrap();
+            options.verify_first = strict;
+            let actions = options.actions().unwrap();
+            assert!(actions.flash.is_empty());
+            assert_eq!(actions.pac_flash.len(), 2);
+            let (peer, _) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &actions,
+                directory.path(),
+                Peer {
+                    rom: true,
+                    directory: directory.path().into(),
+                    ..Peer::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                peer.calls,
+                [
+                    ("FDA".into(), b"ROM".to_vec()),
+                    ("ospi1$da".into(), b"agent".to_vec()),
+                    ("emmc1$$kernel_a".into(), b"A".to_vec()),
+                    ("emmc1$$rootfs".into(), b"ROOT".to_vec())
+                ]
+            );
+            if !strict {
+                assert!(peer.cache_counts[2..].iter().all(|count| *count == 2));
+            }
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn pac_backed_flash_is_scoped_to_source_and_keeps_raw_ancestor_names() {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        let nested = packet(&[("kernel_a", 6, b"A"), ("kernel_b", 6, b"B")]);
+        std::fs::write(&path, packet(&[("nested_a", 7, &nested)])).unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Cli::try_parse_from([
+                "sddownload",
+                "--emmc1",
+                path.to_str().unwrap(),
+                "--ssd",
+                path.to_str().unwrap(),
+                "--flash",
+                "emmc1$nested_a$kernel_b",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            options.verify_first = strict;
+            let actions = options.actions().unwrap();
+            let (peer, _) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &actions,
+                directory.path(),
+                Peer {
+                    directory: directory.path().into(),
+                    ..Peer::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                peer.calls,
+                [("emmc1$nested_a$kernel_b".into(), b"B".to_vec())]
+            );
+        }
+    }
+
+    #[test]
+    fn pac_backed_flash_validates_missing_empty_and_bootstrap_selections() {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        for (name, kind, data, target, expected) in [
+            (
+                "kernel_a",
+                6,
+                b"A".as_slice(),
+                "emmc1$$kernel_b",
+                "selection not found",
+            ),
+            (
+                "empty_a",
+                6,
+                b"".as_slice(),
+                "emmc1$$empty_a",
+                "no image payload",
+            ),
+            (
+                "FDA",
+                0,
+                b"ROM".as_slice(),
+                "emmc1$$FDA",
+                "bootstrap loader/container",
+            ),
+        ] {
+            std::fs::write(&path, packet(&[(name, kind, data)])).unwrap();
+            for strict in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Cli::try_parse_from([
+                    "sddownload",
+                    "--emmc1",
+                    path.to_str().unwrap(),
+                    "--flash",
+                    target,
+                    path.to_str().unwrap(),
+                ])
+                .unwrap();
+                options.verify_first = strict;
+                let actions = options.actions().unwrap();
+                let connections = Rc::new(Cell::new(0));
+                let error = stream_inputs(
+                    &options,
+                    &Config::load(None).unwrap(),
+                    &actions,
+                    directory.path(),
+                    Peer {
+                        directory: directory.path().into(),
+                        connections: connections.clone(),
+                        ..Peer::default()
+                    },
+                )
+                .err()
+                .unwrap();
+                assert!(format!("{error:#}").contains(expected), "{error:#}");
+                assert_eq!(connections.get(), 0);
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_erases_precede_pac_selected_images_after_all_bootstrap_stages() {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        std::fs::write(
+            &path,
+            packet(&[
+                ("FDA", 0, b"ROM"),
+                ("OPSIDA", 1, b"ospi"),
+                ("kernel_a", 6, b"A"),
+                ("EMMCDA", 2, b"emmc"),
+                ("rootfs", 6, b"ROOT"),
+            ]),
+        )
+        .unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Cli::try_parse_from([
+                "sddownload",
+                "--emmc1",
+                path.to_str().unwrap(),
+                "--erase",
+                "emmc1$$other",
+                "--flash",
+                "emmc1$$rootfs",
+                path.to_str().unwrap(),
+                "--flash",
+                "emmc1$$kernel_a",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            options.verify_first = strict;
+            let actions = options.actions().unwrap();
+            let (peer, _) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &actions,
+                directory.path(),
+                Peer {
+                    rom: true,
+                    directory: directory.path().into(),
+                    ..Peer::default()
+                },
+            )
+            .unwrap();
+            let names: Vec<_> = peer.calls.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "FDA",
+                    "ospi1$da",
+                    "emmc1$da",
+                    "erase:emmc1$$other",
+                    "emmc1$$kernel_a",
+                    "emmc1$$rootfs"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn pac_path_aliases_are_selected_and_different_paths_remain_raw_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("firmware.pac");
+        let raw = directory.path().join("kernel.img");
+        std::fs::create_dir(directory.path().join("sub")).unwrap();
+        let alias = directory.path().join("sub/../firmware.pac");
+        std::fs::write(&path, packet(&[("kernel_a", 6, b"A")])).unwrap();
+        std::fs::write(&raw, b"raw").unwrap();
+        let options = Cli::try_parse_from([
+            "sddownload",
+            "--emmc1",
+            path.to_str().unwrap(),
+            "--flash",
+            "emmc1$$kernel_a",
+            alias.to_str().unwrap(),
+            "--flash",
+            "emmc1$$other",
+            raw.to_str().unwrap(),
+        ])
+        .unwrap();
+        let actions = options.actions().unwrap();
+        assert_eq!(actions.pac_flash.len(), 1);
+        assert_eq!(actions.flash, [("emmc1$$other".into(), raw)]);
+        assert!(options.validate_stdin().is_ok());
+        let duplicate = Cli::try_parse_from([
+            "sddownload",
+            "--emmc1",
+            path.to_str().unwrap(),
+            "--flash",
+            "emmc1$$kernel_a",
+            path.to_str().unwrap(),
+            "--flash",
+            "emmc1$$kernel_a",
+            alias.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(duplicate
+            .actions()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate PAC --flash"));
+    }
+
+    #[test]
+    fn explicit_pac_flashes_keep_the_standalone_image_erase_policy() {
+        assert!(erase_before_flash("ssd$$rootfs", true));
+        assert!(!erase_before_flash("ssd$$rootfs", false));
+        assert!(erase_before_flash("emmc1$$kernel_a", true));
+        assert!(erase_before_flash("emmc1$$kernel_a", false));
+        assert!(erase_before_flash("nvm$$partition", true));
+        assert!(!erase_before_flash("nvm$$data", true));
+    }
+
+    #[test]
+    fn pac_backed_flash_supports_version_one_global_pacs() {
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("global.pac");
+        let child = packet(&[("kernel_a", 6, b"A"), ("other", 6, b"skip")]);
+        let mut bytes = packet(&[("emmc1", 7, &child)]);
+        bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        let mut crc = sdimage::BZIP2.digest();
+        crc.update(&bytes[..1020]);
+        crc.update(&bytes[1024..]);
+        bytes[1020..1024].copy_from_slice(&crc.finalize().to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Cli::try_parse_from([
+                "sddownload",
+                "--pac",
+                path.to_str().unwrap(),
+                "--flash",
+                "emmc1$$kernel_a",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            options.verify_first = strict;
+            let actions = options.actions().unwrap();
+            let (peer, _) = stream_inputs(
+                &options,
+                &Config::load(None).unwrap(),
+                &actions,
+                directory.path(),
+                Peer {
+                    directory: directory.path().into(),
+                    ..Peer::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(peer.calls, [("emmc1$$kernel_a".into(), b"A".to_vec())]);
+        }
+    }
+
+    #[test]
+    fn verify_first_checks_all_pac_selections_before_bootstrap_or_selected_writes() {
+        let input = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = input.path().join("firmware.pac");
+        std::fs::write(
+            &path,
+            packet(&[
+                ("FDA", 0, b"ROM"),
+                ("OPSIDA", 1, b"agent"),
+                ("kernel_a", 6, b"A"),
+            ]),
+        )
+        .unwrap();
+        let options = Cli::try_parse_from([
+            "sddownload",
+            "--emmc1",
+            path.to_str().unwrap(),
+            "--flash",
+            "emmc1$$kernel_a",
+            path.to_str().unwrap(),
+            "--flash",
+            "emmc1$$missing",
+            path.to_str().unwrap(),
+            "--verify-first",
+        ])
+        .unwrap();
+        let actions = options.actions().unwrap();
+        let connections = Rc::new(Cell::new(0));
+        let received = Rc::new(Cell::new(0));
+        let error = stream_inputs(
+            &options,
+            &Config::load(None).unwrap(),
+            &actions,
+            directory.path(),
+            Peer {
+                rom: true,
+                directory: directory.path().into(),
+                connections: connections.clone(),
+                received: received.clone(),
+                ..Peer::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("selection not found"),
+            "{error:#}"
+        );
+        assert_eq!(connections.get(), 0);
+        assert_eq!(received.get(), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1614,6 +2099,7 @@ mod tests {
             options: &options,
             actions: &actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         };
         engine
             .entry("emmc1", entry("kernel", 6, 3), &mut b"abc".as_slice(), &[])
@@ -1648,6 +2134,7 @@ mod tests {
             options: &options,
             actions: &actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         };
         engine
             .entry(
@@ -1699,6 +2186,7 @@ mod tests {
             options: &options,
             actions: &actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         };
         engine
             .entry("emmc1", entry("da", 2, 4), &mut b"emmc".as_slice(), &[])
@@ -1734,6 +2222,7 @@ mod tests {
             options: &options,
             actions: &actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         };
         let mut bytes = vec![0; sdimage::pac::TABLE_END as usize];
         bytes[..4].copy_from_slice(&sdimage::pac::MAGIC.to_le_bytes());
@@ -1770,6 +2259,7 @@ mod tests {
             options: &options,
             actions: &actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         };
         let mut image = entry("kernel", 6, 7);
         image.slot_ab = true;

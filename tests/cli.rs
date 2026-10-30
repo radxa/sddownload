@@ -618,7 +618,9 @@ fn flash_and_read_require_two_arguments_per_occurrence() {
 fn flash_stdin_conflicts_fail_before_input_or_device_access() {
     for arguments in [
         vec!["--auto", "--flash", "boot", "-", "--fda", "-"],
-        vec!["--auto", "--flash", "boot", "-", "--emmc1", "-"],
+        vec![
+            "--auto", "--flash", "boot", "-", "--emmc1", "-", "--ssd", "-",
+        ],
         vec!["--auto", "--flash", "boot", "-", "--flash", "system", "-"],
     ] {
         let result = cargo_bin_cmd!("sddownload")
@@ -634,6 +636,58 @@ fn flash_stdin_conflicts_fail_before_input_or_device_access() {
         assert!(!error.contains("ADB auto-reboot"));
         assert!(!error.contains("Staging flash image"));
     }
+}
+
+#[test]
+fn pac_flash_shared_stdin_reports_missing_selection_without_reopening_input() {
+    for strict in [false, true] {
+        let mut command = cargo_bin_cmd!("sddownload");
+        command.args(["--auto", "--emmc1", "-", "--flash", "emmc1$$missing", "-"]);
+        if strict {
+            command.arg("--verify-first");
+        }
+        let result = command
+            .write_stdin(packet(0, &[("other", 6, b"image")], true))
+            .timeout(Duration::from_secs(3))
+            .assert()
+            .code(1);
+        let error = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(error.contains("PAC --flash selection not found"), "{error}");
+        assert!(
+            !error.contains("stdin can only")
+                && !error.contains("Staging flash image")
+                && !error.contains("ADB auto-reboot"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn pac_flash_shared_stdin_verify_first_rejects_crc_before_device_access() {
+    let mut bytes = packet(0, &[("kernel_a", 6, b"image")], true);
+    *bytes.last_mut().unwrap() ^= 1;
+    let result = cargo_bin_cmd!("sddownload")
+        .args([
+            "--auto",
+            "--emmc1",
+            "-",
+            "--flash",
+            "emmc1$$kernel_a",
+            "-",
+            "--verify-first",
+        ])
+        .write_stdin(bytes)
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .code(1);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("CRC mismatch"), "{error}");
+    assert!(
+        !error.contains("stdin can only")
+            && !error.contains("Staging flash image")
+            && !error.contains("ADB auto-reboot"),
+        "{error}"
+    );
 }
 
 #[test]

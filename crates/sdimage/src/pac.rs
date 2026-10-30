@@ -113,6 +113,8 @@ impl std::fmt::Display for PacFileType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub partition: String,
+    /// Original hierarchical PAC name, before download-time slot normalization.
+    pub resource_name: String,
     pub kind: PacFileType,
     pub size: u64,
     pub offset: u64,
@@ -195,7 +197,7 @@ impl Pac {
             entries: vec![],
             empty: vec![],
         };
-        pac.walk(&mut file, 0, size, &[], verify)?;
+        pac.walk(&mut file, 0, size, &[], &[], verify)?;
 
         Ok(pac)
     }
@@ -206,6 +208,7 @@ impl Pac {
         base: u64,
         len: u64,
         parents: &[String],
+        resource_parents: &[String],
         verify: bool,
     ) -> Result<()> {
         let depth = parents.len();
@@ -262,6 +265,8 @@ impl Pac {
         for raw in table.chunks_exact(128) {
             let mut name = text(&raw[..72])?;
             valid_name(&name)?;
+            let original_name = name.clone();
+            let resource_name = name_for(resource_parents, &original_name, all);
             let size = u64le(raw, 72);
             let relative = u64le(raw, 80);
             let kind = PacFileType::from(u32le(raw, 88));
@@ -291,12 +296,15 @@ impl Pac {
 
                 let mut children = parents.to_vec();
                 children.push(name);
-                self.walk(file, offset, size, &children, verify)?;
+                let mut resource_children = resource_parents.to_vec();
+                resource_children.push(original_name);
+                self.walk(file, offset, size, &children, &resource_children, verify)?;
             } else {
                 let mut components = parents.to_vec();
                 components.push(format!("{name}.bin"));
                 self.entries.push(Entry {
                     partition: name_for(parents, &name, all),
+                    resource_name,
                     kind,
                     size,
                     offset,
@@ -465,6 +473,7 @@ mod tests {
         fs::write(&source, outer).unwrap();
         let pac = Pac::open(&source, true).unwrap();
         assert_eq!(pac.entries[0].partition, "ap1$kernel");
+        assert_eq!(pac.entries[0].resource_name, "ap1$kernel_a");
         assert!(pac.entries[0].slot_ab);
         let mut reported = vec![];
         let result = pac

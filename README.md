@@ -52,7 +52,7 @@ Long options use hyphens between words:
 --sn SERIAL      --b-part         --skip-verify    --verify-first
 --auto           --reboot         --debug
 --unpac-path DIRECTORY
---flash PARTITION PATH           (repeatable; - reads stdin)
+--flash PARTITION PATH           (repeatable; image path or matching PAC input)
 --erase 'PARTITION'               (repeatable)
 --read PARTITION PATH            (repeatable; - writes stdout)
 -h / --help
@@ -143,7 +143,8 @@ sddownload --fda fda.bin --flash 'emmc1$$kernel' kernel.img
 
 `--fda` overrides every primary ROM FDA in the supplied PACs, including nested
 and later copies; other download agents retain their usual bootstrap order.
-Only one FDA, PAC, or explicit flash input may use stdin. The raw FDA is staged in a temporary
+Only one independent FDA, PAC, or raw flash input may use stdin. References from
+`--flash` to a PAC stdin input share that stream. The raw FDA is staged in a temporary
 file to determine its size, so stdin must reach EOF before transfer starts.
 Empty and ELF FDA images are rejected before device access. `--verify-first`
 still validates all PAC CRCs before sending the FDA. `--fda` conflicts with the
@@ -162,14 +163,53 @@ sddownload --fda fda.bin --read 'emmc1$$kernel' - > kernel.img
 sddownload --auto --flash 'emmc1$$boot' boot.img --flash 'emmc1$$system' system.img
 ```
 
-A flash image from stdin is staged to disk before device access to determine
+A standalone raw flash image from stdin is staged to disk before device access to determine
 its length; stdin must reach EOF before flashing begins. Only one input across
-FDA, PAC, and `--flash` can use stdin. Only one `--read` destination can use
+FDA, PAC, and raw `--flash` inputs can use stdin. PAC-backed flash selections
+may reference the same PAC stdin repeatedly. Only one `--read` destination can use
 stdout. Readback to stdout is staged to disk and published only after its MD5
 and final device response are verified. Status and progress messages go to
 stderr when reading to stdout, keeping redirected output binary-clean. A failed
 verification publishes no readback bytes; an output write failure returns an
 error. File readbacks continue to use atomic replacement after verification.
+
+### Flash selected images from a PAC
+
+If a `--flash PARTITION PATH` path matches a PAC input path, its image is taken
+from the same-named resource inside that PAC instead of treating the whole PAC
+as a raw partition image. Equivalent filesystem paths, including relative path
+aliases and symlinks, are recognized. Use the exact storage-qualified resource
+name from `--list-partitions`, including slot suffixes such as `_a`:
+
+```sh
+sddownload --emmc1 global.pac --flash 'emmc1$ap1$kernel_a' global.pac
+
+ssh ubuntu24 cat /path/to/global.pac | sddownload --emmc1 - \
+  --flash 'emmc1$ap1$kernel_a' - --flash 'emmc1$ap1$rootfs' -
+```
+
+The shared `-` references consume one PAC stream once; they do not stage it as
+a standalone image or reopen stdin. Required FDA/download agents still run,
+but unselected image payloads are neither flashed nor cached. PAC-backed images
+are processed in forward physical PAC order, regardless of the order of the
+selection arguments, preserving normal backpressure. Explicit names select only
+that partition: `--b-part` does not expand a selected `_a` resource to an
+inferred `_b` target. If a name appears multiple times in the PAC, each matching
+image entry is processed in traversal order. Duplicate selection arguments for
+the same source and partition are rejected.
+
+A different path retains standalone-image behavior. These standalone flashes
+run after the PAC-backed selections, in their command-line order. Explicit
+`--erase` actions always precede explicit flashes: when combined with PAC-backed
+selections, the selected payloads are staged until all PAC/bootstrap inputs have
+been consumed, then erased/flashed in that order. This is a required replay
+cache, not prefetch merely because USB is busy.
+
+Missing, empty, and bootstrap-resource selections fail with an error. Normal
+streaming can already have bootstrapped or flashed earlier selections before a
+later error is discovered. `--verify-first` validates PAC CRCs and all requested
+selections before any device access. The PAC is still fully consumed for normal
+CRC/traversal handling even when most image entries are unselected.
 
 ## Listing partitions
 
@@ -219,7 +259,8 @@ download agents, nested PAC containers, empty entries, and repeated resources.
 Resource names retain the PAC's original slot suffixes and parent names, with
 the appropriate storage prefix. Only names present in the PAC are listed:
 `kernel_a` does not produce a `kernel_b` row unless a B entry is actually present.
-Normal flashing still uses its existing slot selection and `--b-part` behavior.
+Automatic full-PAC flashing still uses its existing slot selection and
+`--b-part` behavior; explicit PAC-backed `--flash` names select only that target.
 
 FDA/download agents and container records are labeled separately because they
 are not ordinary partitions for `--read` or `--flash`. Empty entries have no

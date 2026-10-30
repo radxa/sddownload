@@ -198,7 +198,7 @@ enum Payload {
 
 enum Work {
     Entry {
-        payload: Payload,
+        payload: Box<Payload>,
         future: Vec<u8>,
         unknown: bool,
     },
@@ -251,6 +251,7 @@ fn produce(
     mut open: impl FnMut(&Path, &Arc<Stop>) -> Result<Box<dyn Read + Send>>,
 ) -> Result<()> {
     let mut empty = BTreeSet::new();
+    let mut selections = SelectionTracker::new(actions);
     if let Some(path) = &options.fda {
         stop.check()?;
         sdeasyboot::statusln!("FDA image: {}", path.display());
@@ -263,7 +264,7 @@ fn produce(
         })?;
         sender
             .send(Work::Entry {
-                payload: Payload::Cached(fda),
+                payload: Box::new(Payload::Cached(fda)),
                 future: vec![],
                 unknown: false,
             })
@@ -279,14 +280,8 @@ fn produce(
         );
         while let Some(entry) = pac.next_entry()? {
             stop.check()?;
-            if overridden_fda(options, &entry) {
-                continue;
-            }
-            if loader(&entry).is_none()
-                && (!actions.is_empty()
-                    || entry.kind == PacFileType::OspiDa
-                    || plan::is_boot(&plan::storage_partition(storage, &entry.partition)))
-            {
+            selections.observe(storage, &entry)?;
+            if !wanted(options, actions, storage, &entry) {
                 continue;
             }
             let future: Vec<_> = pac
@@ -313,11 +308,11 @@ fn produce(
                 };
                 sender
                     .send(Work::Entry {
-                        payload: Payload::Direct {
+                        payload: Box::new(Payload::Direct {
                             storage: storage.into(),
                             entry,
                             reader,
-                        },
+                        }),
                         future,
                         unknown,
                     })
@@ -367,7 +362,7 @@ fn produce(
                 };
                 sender
                     .send(Work::Entry {
-                        payload: Payload::Cached(cached),
+                        payload: Box::new(Payload::Cached(cached)),
                         future,
                         unknown,
                     })
@@ -391,6 +386,9 @@ fn produce(
                 result?;
             }
         }
+        for entry in &pac.empty_entries {
+            selections.observe(storage, entry)?;
+        }
         for partition in &pac.empty {
             if matches!(storage, "emmc1" | "sd" | "pac") {
                 let partition = plan::storage_partition(storage, partition);
@@ -413,6 +411,7 @@ fn produce(
             path.display()
         );
     }
+    selections.finish()?;
     sender
         .send(Work::Done(empty))
         .map_err(|_| anyhow::anyhow!("USB worker stopped"))?;
@@ -448,6 +447,14 @@ fn identical(left: &Cached, right: &Cached) -> Result<bool> {
 
 impl<T: Target> Early<'_, T> {
     fn can_flash(&mut self, future: &[u8], unknown: bool) -> Result<bool> {
+        // Explicit erases precede all explicit flashes. PAC selections must be
+        // retained until every bootstrap input has been traversed in this case.
+        if !self.engine.actions.pac_flash.is_empty()
+            && !self.engine.actions.erase.is_empty()
+            && !self.engine.actions_prepared
+        {
+            return Ok(false);
+        }
         if future.iter().any(|rank| !self.committed.contains_key(rank))
             || self
                 .engine
@@ -562,10 +569,16 @@ fn consume<T: Target>(
                 future,
                 unknown,
             } => {
-                early.accept(payload, &future, unknown)?;
+                early.accept(*payload, &future, unknown)?;
             }
             Work::Done(empty) => {
                 early.flush(&[], false)?;
+                if !early.engine.actions.pac_flash.is_empty()
+                    && !early.engine.actions.erase.is_empty()
+                {
+                    early.engine.prepare_actions()?;
+                    early.flush(&[], false)?;
+                }
                 ensure!(
                     early.engine.cached.is_empty(),
                     "ROM mode requires --fda or an FDA image from a PAC"
@@ -612,6 +625,7 @@ fn run_with_input<T: Target>(
             options,
             actions,
             cached: VecDeque::new(),
+            actions_prepared: false,
         },
         committed: BTreeMap::new(),
         stop: stop.clone(),

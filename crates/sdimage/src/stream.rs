@@ -219,13 +219,16 @@ impl<R: Read> PacStream<R> {
             let size = long(row, 72);
             let kind = PacFileType::from(word(row, 88));
             let container = kind == PacFileType::Pac || (parents.is_empty() && version == 1);
-            let resource_components = if self.collect_resources {
+            let resource_name = super::pac::name_for(&resource_parents, &name, self.version == 1);
+            if self.collect_resources {
                 self.resources.push(Resource {
-                    name: super::pac::name_for(&resource_parents, &name, self.version == 1),
+                    name: resource_name.clone(),
                     size,
                     kind,
                     container,
                 });
+            }
+            let resource_components = if container {
                 let mut components = resource_parents.clone();
                 components.push(name.clone());
                 components
@@ -243,6 +246,7 @@ impl<R: Read> PacStream<R> {
                 components.push(format!("{name}.bin"));
                 self.empty_entries.push(Entry {
                     partition: partition.clone(),
+                    resource_name,
                     kind,
                     size,
                     offset: 0,
@@ -271,6 +275,7 @@ impl<R: Read> PacStream<R> {
             items.push(Item {
                 entry: Entry {
                     partition,
+                    resource_name,
                     kind,
                     size,
                     offset,
@@ -480,6 +485,7 @@ pub(crate) mod tests {
         let mut pac = PacStream::with_resource_metadata(bytes.as_slice(), true).unwrap();
         let entry = pac.next_entry().unwrap().unwrap();
         assert_eq!(entry.partition, "nested$kernel");
+        assert_eq!(entry.resource_name, "nested_a$kernel_a");
         assert!(entry.slot_ab);
         pac.finish().unwrap();
         let names: Vec<_> = pac

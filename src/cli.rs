@@ -78,7 +78,7 @@ pub struct Cli {
     #[arg(long, value_name = "DIRECTORY")]
     pub unpac_path: Option<PathBuf>,
 
-    /// Flash an image to a partition; PATH may be - for stdin (repeatable).
+    /// Flash image or matching PAC resource; PATH may be - for stdin (repeatable).
     #[arg(long, num_args = 2, value_names = ["PARTITION", "PATH"], action = clap::ArgAction::Append)]
     pub flash: Vec<String>,
     /// Erase a partition (repeatable).
@@ -99,14 +99,42 @@ pub struct Cli {
 #[derive(Default, Debug)]
 struct Actions {
     flash: Vec<(String, PathBuf)>,
+    pac_flash: Vec<PacFlash>,
     erase: Vec<(String, u64)>,
     read: Vec<(String, PathBuf)>,
 }
 
+#[derive(Debug)]
+struct PacFlash {
+    partition: String,
+    path: PathBuf,
+    storages: Vec<&'static str>,
+}
+
+impl PacFlash {
+    fn matches(&self, storage: &str, entry: &sdimage::pac::Entry) -> bool {
+        self.storages.contains(&storage)
+            && self.partition == crate::plan::storage_partition(storage, &entry.resource_name)
+    }
+}
+
 impl Actions {
     fn is_empty(&self) -> bool {
-        self.flash.is_empty() && self.erase.is_empty() && self.read.is_empty()
+        self.flash.is_empty()
+            && self.pac_flash.is_empty()
+            && self.erase.is_empty()
+            && self.read.is_empty()
     }
+}
+
+fn same_input_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || (left != Path::new("-")
+            && right != Path::new("-")
+            && std::fs::canonicalize(left)
+                .ok()
+                .zip(std::fs::canonicalize(right).ok())
+                .is_some_and(|(left, right)| left == right))
 }
 
 impl Cli {
@@ -120,7 +148,9 @@ impl Cli {
         let flash_stdin = self
             .flash
             .chunks_exact(2)
-            .filter(|pair| pair[1] == "-")
+            // References to a PAC stdin input share that stream instead of
+            // declaring another raw-image stdin consumer.
+            .filter(|pair| pair[1] == "-" && pac_stdin == 0)
             .count();
         ensure!(
             pac_stdin + fda_stdin + flash_stdin <= 1,
@@ -159,16 +189,41 @@ impl Cli {
         }
 
         let mut actions = Actions {
-            flash: partition_paths(&self.flash, "--flash")?,
             read: partition_paths(&self.read, "--read")?,
             ..Actions::default()
         };
-        for (_, path) in &actions.flash {
+        for (partition, path) in partition_paths(&self.flash, "--flash")? {
             ensure!(
                 path == Path::new("-") || path.is_file(),
                 "flash image does not exist: {}",
                 path.display()
             );
+            let storages: Vec<_> = self
+                .inputs()
+                .into_iter()
+                .filter(|(_, input)| same_input_path(input, &path))
+                .map(|(storage, _)| storage)
+                .collect();
+            if storages.is_empty() {
+                actions.flash.push((partition, path));
+            } else {
+                ensure!(
+                    !actions
+                        .pac_flash
+                        .iter()
+                        .any(|previous| previous.partition == partition
+                            && previous
+                                .storages
+                                .iter()
+                                .any(|storage| storages.contains(storage))),
+                    "duplicate PAC --flash selection: {partition}"
+                );
+                actions.pac_flash.push(PacFlash {
+                    partition,
+                    path,
+                    storages,
+                });
+            }
         }
         ensure!(
             actions

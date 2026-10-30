@@ -103,6 +103,65 @@ fn explicit_fda_stdin_is_binary_and_precedes_pac_bootstrap() {
     }
 }
 
+#[test]
+fn pac_backed_flash_shares_stdin_and_only_reads_the_pac_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = Cli::try_parse_from([
+        "sddownload",
+        "--emmc1",
+        "-",
+        "--flash",
+        "emmc1$$rootfs",
+        "-",
+        "--flash",
+        "emmc1$$kernel_a",
+        "-",
+    ])
+    .unwrap();
+    let actions = options.actions().unwrap();
+    assert!(actions.flash.is_empty());
+    assert_eq!(actions.pac_flash.len(), 2);
+    let bytes = packet(&[
+        ("FDA", 0, b"ROM"),
+        ("OPSIDA", 1, b"agent"),
+        ("kernel_a", 6, b"A"),
+        ("skip", 6, b"unused"),
+        ("rootfs", 6, b"ROOT"),
+        ("kernel_b", 6, b"B"),
+    ]);
+    let mut source = Some(bytes);
+    let opens = std::sync::atomic::AtomicUsize::new(0);
+    let (peer, _) = run_with_input(
+        &options,
+        &Config::load(None).unwrap(),
+        &actions,
+        directory.path(),
+        Peer {
+            rom: true,
+            ..Peer::default()
+        },
+        |path, _| {
+            assert_eq!(path, Path::new("-"));
+            opens.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(io::Cursor::new(
+                source.take().expect("stdin reopened"),
+            )))
+        },
+    )
+    .unwrap();
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        peer.calls,
+        [
+            ("FDA".into(), b"ROM".to_vec()),
+            ("ospi1$da".into(), b"agent".to_vec()),
+            ("emmc1$$kernel_a".into(), b"A".to_vec()),
+            ("emmc1$$rootfs".into(), b"ROOT".to_vec())
+        ]
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_cancellation_retries_if_it_arrives_just_before_readfile() {
